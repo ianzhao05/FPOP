@@ -35,9 +35,16 @@ Axiom cheat : forall {A : Type}, A.
 
 Ltac __cheat := eapply cheat; eauto.
 
+Ltac unfold_motive G :=
+  match G with 
+  | ?x => unfold x
+  | (?f ?x) => unfold x; unfold_motive f
+  end.
+
 Ltac __unfold_ftheorem_motive := 
-  match goal with 
-  | [ |- ?h ?t] => try unfold h; try unfold t 
+  match goal with
+  | [ |- ?h ?t ] => unfold_motive (h t)
+  | _ => idtac
   end.
 
 Ltac generalize_pose c :=
@@ -49,13 +56,13 @@ Ltac prove_prec :=
 Ltac unfold_nested G :=
   match G with 
   | True => idtac
-  | (prod (?h ?a) ?G2)  => unfold h; unfold a; unfold_nested G2  
+  | ((?h ?a) /\ ?G2)  => unfold_motive (h a); unfold_nested G2  
   end.
 
 (* Need a recursive unfolding *)
 Ltac __unfold_ftheorem_motive_nested := 
   match goal with 
-  | [ |- (prod ?a ?b) ] => unfold_nested (prod a b)
+  | [ |- (?a /\ ?b) ] => unfold_nested (a /\ b)
   | _ => idtac
   end.
 
@@ -150,4 +157,3 @@ Ltac fdiscriminate heq :=
   match type of heq with 
   | ?X = _ => let typ := type of X in fdiscriminate_by heq typ
   end.
-

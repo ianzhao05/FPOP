@@ -42,18 +42,18 @@ type claim_type =
                  auxillary_motive_modname : name;
                  implementing_handlers : (name, coqterm typed) smap;
   (* the (new) case handlers (their types) to prove  *)
-                 all_handler_names : name list;
+                 all_handler_names : name list list;
                  extending : bool;
   (* Possibly inherited module *)
                  parameter_for_ctx : modtermref list;
   (* the ctx parameter of the current opening module *)
-                 indref : Libnames.qualid typed;
+                 indrefs : Libnames.qualid list typed;
                  postfix : string;
                  recty : coqtype typed ;
                  wrapped_recty_in_tm : coqterm typed;
                  }
 type claim_goal_info_type = 
-  { fname : name ;  (* the name of the field *)
+  { fnames : name list ;  (* the name of the field *)
     modname : name CAst.t ; (* The openning scope module has the name *)
     goal : rawterm ;  (* The rawterm for the goal *)
     claimT : claim_type; 
@@ -116,7 +116,7 @@ let open_claim_goal_info_prepare ?(ov_dependencies = (None : Set_Fieldpath.t opt
       (fun (n,m) -> 
         (None, [CAst.make n], (m, Declaremods.DefaultInline))) parameters_with_self in 
   let ov_dependencies = Option.map (fun x -> Pins x) ov_dependencies in 
-  claim_goal_info := Some {fname; modname; goal; claimT = SimpleGoal; ov_dependencies; overriding_info = None};
+  claim_goal_info := Some {fnames = [fname]; modname; goal; claimT = SimpleGoal; ov_dependencies; overriding_info = None};
   (modname, parameters_)
 
 let override_open_claim_goal_info_prepare ?(ov_dependencies = (None : Set_Fieldpath.t option)) (goals : (name * Constrexpr.constr_expr) list) = 
@@ -150,7 +150,7 @@ let override_open_claim_goal_info_prepare ?(ov_dependencies = (None : Set_Fieldp
       (fun (n,m) -> 
         (None, [CAst.make n], (m, Declaremods.DefaultInline))) parameters_with_self in
   (* let ov_dependencies = Option.map (fun x -> Pins x) ov_dependencies in  *)
-  claim_goal_info := Some {fname; modname; goal; claimT = SimpleGoal; ov_dependencies; overriding_info = Some parentty};
+  claim_goal_info := Some {fnames = [fname]; modname; goal; claimT = SimpleGoal; ov_dependencies; overriding_info = Some parentty};
   (modname, parameters_)
 
 
@@ -158,7 +158,7 @@ let start_proving_claim_goal_info () =
   let fname, goal = 
     match !claim_goal_info with 
     | None -> cerror ~einfo:"Should be inside FieldClaim!" ()
-    | Some {fname; goal; _} -> fname, goal in  
+    | Some {fnames; goal; _} -> List.hd fnames, goal in  
   (* type checking *)
   let env = Global.env () in
   let evd = Evd.from_env env in
@@ -175,7 +175,7 @@ let close_claim_and_collect_claim_goal_info () =
     let fname, goal, modname, new_dependencies, overriding_info = 
       match !claim_goal_info with 
       | None -> cerror ~einfo:"Should be right after FieldClaim!" ()
-      | Some {fname; goal; modname; ov_dependencies;overriding_info; _} -> fname, goal, modname, ov_dependencies, overriding_info in  
+      | Some {fnames; goal; modname; ov_dependencies;overriding_info; _} -> List.hd fnames, goal, modname, ov_dependencies, overriding_info in  
     assert_cerror_forced ~einfo:"Claim is not proved!" (fun _ -> Constrintern.is_global fname);
     let isopaque = 
       let fname_constant = Nametab.locate_constant (Libnames.qualid_of_ident fname) in 
@@ -241,38 +241,46 @@ let close_claim_and_collect_claim_goal_info () =
 (* FTheorem related *)
 let open_ftheorem_info_prepare 
     (* ?(ov_dependencies = Set_Fieldpath.empty) *)
-    (fname : name) 
-    (motive : rawterm) 
+    (fnames : name list) 
+    (motives : rawterm list) 
     ?(postfix = "_ind_comp")
-    (indtype : Libnames.qualid) = 
+    (indtypes : Libnames.qualid list) = 
   (* we still use claim_goal facility *)
   assert_current_has_open_judgement();
-  if_allow_new_field fname;
+  if_allow_new_fields fnames;
   assert_cerror_forced ~einfo:"Please close last claim" (fun () -> !claim_goal_info = None);
   let current_ctx = currentinh_output_ctx () in
   let open CoqVernacUtils in 
   (* we first compile the motive to pass the type-checking of the motive *)
+  let fname = List.hd fnames in
+  let motive_mod_prefix = Nameops.add_suffix fname "_motive_mod" in
   let compiled_motive = 
-    let modname = freshen_name ~prefix:(Nameops.add_suffix fname "_motive_mod") () in 
+    let modname = freshen_name ~prefix:motive_mod_prefix () in 
     let parameters = famctx_to_parameters_selfprefix current_ctx in 
     runVernac @@ 
     define_module modname parameters 
-    (fun ctx -> define_term ((Nameops.add_prefix "__motiveT" fname)) motive) in 
+    (fun ctx ->
+      flatmap (List.map (fun (fname, motive) ->
+        define_term (Nameops.add_prefix "__motiveT" fname) motive
+      ) (List.combine fnames motives))
+    ) in
   let compiled_motive = ModType compiled_motive, current_ctx in
 
   (*  then we locate the inddefs, and get the recursor (type) *)
-  let inddef = 
-    let t = locate_in_fam_type_withself current_ctx indtype in 
+  let inddef, name_groups = 
+    let t = locate_in_fam_type_withself current_ctx (List.hd indtypes) in 
     match t with 
-    | CoqIndTy {indsigs_from_org_ctx; _}-> indsigs_from_org_ctx
+    | CoqIndTy {indsigs_from_org_ctx; name_groups; _}-> indsigs_from_org_ctx, name_groups
     | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
-  let _, inddef_and_recursor_handlers = inductive_to_famterm_and_recursor_type inddef in 
-  let _, all_recur_handlers = smap_assoc ~einfo:__LOC__ postfix  inddef_and_recursor_handlers  in 
+  let _, inddef_and_recursor_handlers = inductive_to_famterm_and_recursor_type inddef in
+  let indnames = List.map Libnames.qualid_basename indtypes in
+  let _, all_recur_handlers = smap_assoc ~einfo:__LOC__ (indnames, postfix) inddef_and_recursor_handlers in 
+  let all_handler_names = List.map (fun x -> List.assoc x name_groups) indnames in
 
   (* we initialize some name here, freshen_name has side effect so it is using a new name now *)
   let open Constrexpr_ops in 
   let goal_name = freshen_name ~prefix:fname () in 
-  let motive_modname = freshen_name ~prefix:(Nameops.add_suffix fname "_motive_mod") () in  
+  let motive_modname = freshen_name ~prefix:motive_mod_prefix () in  
   let modname = CAst.make @@ freshen_name ~prefix:fname () in
   (* what is auxillary_motive_modname? *)
   let auxillary_motive_modname = 
@@ -294,8 +302,8 @@ let open_ftheorem_info_prepare
     let wrapped_compiled_motive_incoqty =
       runVernac @@ wrap_modtype_into_module_modtype auxillary_motive_modname motive parameters_ in 
     (* We wrap the motive inside motive_modname *)
-    let motiveTpathprefix = Some (Libnames.qualid_of_ident auxillary_motive_modname) in 
-    let res1 = get_recty_from_motive ~motiveTpathprefix fname (ModTerm wrapped_compiled_motive_incoqty, _ctx) in 
+    let motiveTpathprefix = Some (Libnames.qualid_of_ident auxillary_motive_modname) in
+    let res1 = get_recty_from_motive ~motiveTpathprefix fnames (ModTerm wrapped_compiled_motive_incoqty, _ctx) in 
     let wrapped_compiled_motive_incoqterm =
       runVernac @@ wrap_inner_mod auxillary_motive_modname motive parameters_ in 
     let res2 = ModTerm wrapped_compiled_motive_incoqterm, _ctx in 
@@ -303,60 +311,65 @@ let open_ftheorem_info_prepare
   in
   let goal = 
     let motive_modname = Libnames.qualid_of_ident motive_modname in 
-    let the_motive = mkRefC @@ _qualid_point_ (Some motive_modname) (Nameops.add_prefix "__motiveT" fname) in 
+    let the_motives = List.map (fun n -> mkRefC @@ _qualid_point_ (Some motive_modname) (Nameops.add_prefix "__motiveT" n)) fnames in 
     let __True = mkIdentC (Names.Id.of_string "True") in
     let __prod l r = 
       let using_prod_or_conj = if postfix = "_ind_comp" then "and" else "prod" in  
       mkAppC (mkIdentC (Names.Id.of_string using_prod_or_conj), [l; r]) in
-    let all_recur_name = List.map (fun x -> Nameops.add_prefix "__handler_type_" (fst x)) all_recur_handlers in 
-    let all_recur_ = List.map mkIdentC ( all_recur_name) in 
-    let all_applied_recur = List.map (fun x -> mkAppC (x, [the_motive])) all_recur_ in 
+    let all_recur_name = List.map (fun (x,_) -> Nameops.add_prefix "__handler_type_" x) all_recur_handlers in 
+    let all_recur_ = List.map mkIdentC all_recur_name in 
+    let all_applied_recur = List.map (fun x -> mkAppC (x, the_motives)) all_recur_ in 
     List.fold_right __prod all_applied_recur __True in 
   let parameters_with_self = famctx_to_parameters_selfprefix current_ctx in 
   let parameter_for_ctx =
-    List.map 
-      (fun (n,m) ->
-        Libnames.qualid_of_ident n) parameters_with_self in 
-  let indref = (indtype, current_ctx) in 
+    List.map (fun (n,_) -> Libnames.qualid_of_ident n) parameters_with_self in 
+  let indrefs = (indtypes, current_ctx) in 
   let all_recur_handlers = List.map (fun (x, y) -> x, (wk_coq_term y current_ctx) ) all_recur_handlers in 
-  let all_handler_names = List.map fst all_recur_handlers in 
   let compiled_motive = fst compiled_motive in 
-  claim_goal_info := Some
-  {fname; modname; goal; ov_dependencies = None;
-        overriding_info = None;
-    claimT = FTheorem {goal_name;compiled_motive; implementing_handlers = all_recur_handlers;all_handler_names; extending = false; parameter_for_ctx; indref; postfix; motive_modname; recty; wrapped_recty_in_tm; auxillary_motive_modname}}
+  claim_goal_info := Some {
+    fnames; modname; goal; ov_dependencies = None; overriding_info = None;
+    claimT = FTheorem {
+      goal_name; compiled_motive; implementing_handlers = all_recur_handlers; all_handler_names;
+      extending = false; parameter_for_ctx; indrefs; postfix;
+      motive_modname; auxillary_motive_modname;
+      recty; wrapped_recty_in_tm;
+    }
+  }
 
 let open_extend_ftheorem_info_prepare 
-    (fname : name)  = 
+    (fnames : name list)  = 
   (* we still use claim_goal facility *)
   (* assert *)
   assert_current_has_open_judgement();
+  let fname = List.hd fnames in
   if_allow_extend_field fname;
   assert_cerror_forced ~einfo:"Please close last claim" (fun () -> !claim_goal_info = None);
-  let motive, indref, postfix, recty, legacy_handlers = 
+  let motive, indrefs, postfix, recty, legacy_handlers = 
     (match top_uninherited_field () with 
-      | Some (fname_, (FTheoremTy {motive; indref; postfix; recty; all_handlers = legacy_handlers} , oldctx)) -> assert_cerror_forced ~einfo:"Not Correct Uninherited Field!" (fun _ -> fname = fname_); 
-      motive, indref, postfix, recty, legacy_handlers
+      | Some (fname_, (FTheoremTy {motive; indrefs; postfix; recty; all_handlers = legacy_handlers; fnames = fnames_} , oldctx)) ->
+        assert_cerror_forced ~einfo:"Not Correct Uninherited Field!" (fun _ -> fnames = fnames_); 
+        motive, indrefs, postfix, recty, List.flatten legacy_handlers
       | _ -> cerror ~einfo:"Not Correct Uninherited Field!" ()) in 
   
   let current_ctx = currentinh_output_ctx () in
   
   (* let open CoqVernacUtils in  *)
   let compiled_motive = motive in 
-  let indref = wkinh_path indref current_ctx in 
+  let indrefs = List.map (fun indref -> wkinh_path (indref, snd indrefs) current_ctx) (fst indrefs) in 
+  let indrefs = List.map fst indrefs, snd (List.hd indrefs) in
   (*  first we locate the inddefs *)
-  let inddef = 
-    let t = locate_in_fam_type_withself current_ctx (fst indref) in 
+  let inddef, name_groups = 
+    let t = locate_in_fam_type_withself current_ctx (List.hd (fst indrefs)) in 
     match t with 
-    | CoqIndTy {indsigs_from_org_ctx; _} -> indsigs_from_org_ctx
+    | CoqIndTy {indsigs_from_org_ctx; name_groups; _} -> indsigs_from_org_ctx, name_groups
     | _-> cerror ~einfo:"Should refer to an inductive type!" () in
   let _, inddef_and_recursor_handlers = inductive_to_famterm_and_recursor_type inddef in 
-  let _, all_recur_handlers = smap_assoc ~einfo:__LOC__ postfix inddef_and_recursor_handlers  in 
+  let indnames = List.map Libnames.qualid_basename (fst indrefs) in
+  let _, all_recur_handlers = smap_assoc ~einfo:__LOC__ (indnames, postfix) inddef_and_recursor_handlers in 
   let all_recur_handlers = List.map (fun (x, y) -> x, (wk_coq_term y current_ctx) ) all_recur_handlers in 
-  let all_handler_names = List.map fst all_recur_handlers in 
+  let all_handler_names = List.map (fun x -> List.assoc x name_groups) indnames in
   let implementing_handlers = 
-    let inside (x : 'a) (l : 'a list) = List.exists (fun k -> k = x) l in 
-    List.filter (fun (x, y) -> not (inside x legacy_handlers)) all_recur_handlers in 
+    List.filter (fun (x, y) -> not (List.mem x legacy_handlers)) all_recur_handlers in 
   let open Constrexpr_ops in 
   let goal_name = freshen_name ~prefix:fname () in 
   let modname = CAst.make @@ freshen_name ~prefix:fname () in
@@ -375,7 +388,7 @@ let open_extend_ftheorem_info_prepare
       runVernac @@ wrap_modtype_into_module_modtype auxillary_motive_modname motive parameters_ in 
     (* We wrap the motive inside motive_modname *)
     let motiveTpathprefix = Some (Libnames.qualid_of_ident auxillary_motive_modname) in 
-    let res1 = get_recty_from_motive ~motiveTpathprefix fname (ModTerm wrapped_compiled_motive_incoqty, _ctx) in 
+    let res1 = get_recty_from_motive ~motiveTpathprefix fnames (ModTerm wrapped_compiled_motive_incoqty, _ctx) in 
     let wrapped_compiled_motive_incoqterm =
       runVernac @@ wrap_inner_mod auxillary_motive_modname motive parameters_ in 
     let res2 = ModTerm wrapped_compiled_motive_incoqterm, _ctx in 
@@ -383,25 +396,27 @@ let open_extend_ftheorem_info_prepare
   in
   let goal = 
     let motive_modname = Libnames.qualid_of_ident motive_modname in 
-    let the_motive = mkRefC @@ _qualid_point_ (Some motive_modname) (Nameops.add_prefix "__motiveT" fname) in 
+    let the_motives = List.map (fun n -> mkRefC @@ _qualid_point_ (Some motive_modname) (Nameops.add_prefix "__motiveT" n)) fnames in
     let __True = mkIdentC (Names.Id.of_string "True") in
     let __prod l r = 
       let using_prod_or_conj = if postfix = "_ind_comp" then "and" else "prod" in  
       mkAppC (mkIdentC (Names.Id.of_string using_prod_or_conj), [l; r]) in
-    let implementing_names = List.map (fun x -> Nameops.add_prefix "__handler_type_" (fst x)) implementing_handlers in 
-    let implementing_recur_ = List.map mkIdentC (implementing_names) in 
-    let implementing__applied_recur = List.map (fun x -> mkAppC (x, [the_motive])) implementing_recur_ in 
+    let implementing_names = List.map (fun (x,_) -> Nameops.add_prefix "__handler_type_" x) implementing_handlers in
+    let implementing_recur_ = List.map mkIdentC implementing_names in 
+    let implementing__applied_recur = List.map (fun x -> mkAppC (x, the_motives)) implementing_recur_ in 
     List.fold_right __prod implementing__applied_recur __True in 
   let parameters_with_self = famctx_to_parameters_selfprefix current_ctx in 
   let parameter_for_ctx =
-    List.map 
-      (fun (n,m) ->
-        Libnames.qualid_of_ident n) parameters_with_self in 
-  claim_goal_info := Some
-  {fname; modname; goal; ov_dependencies = None ;
-        overriding_info = None;
-    claimT = FTheorem {goal_name;compiled_motive; implementing_handlers;all_handler_names; extending = true; parameter_for_ctx; indref; postfix; motive_modname;
-    auxillary_motive_modname; recty; wrapped_recty_in_tm}}
+    List.map (fun (n,_) -> Libnames.qualid_of_ident n) parameters_with_self in 
+  claim_goal_info := Some {
+    fnames; modname; goal; ov_dependencies = None; overriding_info = None;
+    claimT = FTheorem {
+      goal_name; compiled_motive; implementing_handlers; all_handler_names;
+      extending = true; parameter_for_ctx; indrefs; postfix;
+      motive_modname; auxillary_motive_modname;
+      recty; wrapped_recty_in_tm;
+    }
+  }
 
 let prepare_proving_ftheorem1 () = 
   let current_ctx = currentinh_output_ctx () in
@@ -514,13 +529,14 @@ let start_proving_ftheorem ?(split=true) () =
 
 (* Close the current goal and prove  *)
 let close_ftheorem () = 
-  let fname, goal, modname, claimT = 
+  let fnames, goal, modname, claimT = 
   match !claim_goal_info with 
   | None -> cerror ~einfo:"Should be inside FTheorem!" ()
-  | Some {fname; goal; modname; claimT;  _} -> fname, goal, modname, claimT in  
-  let goal_name, extending, implemented_handlers, parameter_for_ctx, indref,compiled_motive, postfix, all_handler_names, motive_modname, auxillary_motive_modname, recty, wrapped_recty_in_tm  = 
+  | Some {fnames; goal; modname; claimT;  _} -> fnames, goal, modname, claimT in  
+  let goal_name, extending, implemented_handlers, parameter_for_ctx, indrefs, compiled_motive, postfix, all_handler_names, motive_modname, auxillary_motive_modname, recty, wrapped_recty_in_tm  = 
   match claimT with 
-  | FTheorem {goal_name;extending;compiled_motive; implementing_handlers; parameter_for_ctx; indref; postfix;all_handler_names;motive_modname;auxillary_motive_modname;recty;wrapped_recty_in_tm; _} -> goal_name, extending, implementing_handlers, parameter_for_ctx, indref,compiled_motive,postfix,all_handler_names,motive_modname,auxillary_motive_modname,recty,wrapped_recty_in_tm
+  | FTheorem {goal_name; extending; compiled_motive; implementing_handlers; parameter_for_ctx; indrefs; postfix; all_handler_names; motive_modname; auxillary_motive_modname; recty; wrapped_recty_in_tm; _} ->
+    goal_name, extending, implementing_handlers, parameter_for_ctx, indrefs, compiled_motive, postfix, all_handler_names, motive_modname, auxillary_motive_modname, recty, wrapped_recty_in_tm
   | SimpleGoal -> cerror ~einfo:"Should be inside FTheorem!" () in
   assert_cerror_forced ~einfo:"Claim is not proved!" (fun _ -> Constrintern.is_global goal_name);
   let all_implemented_handler_names = List.map fst implemented_handlers in 
@@ -565,32 +581,32 @@ let close_ftheorem () =
     get_recty_from_motive fname (ModTerm motive, _ctx) 
   in *)
   (* Construct the recursor, also record the context for it *)
-  let raw_recursor indref_prepath handler_mod_name cstrnames =
+  let raw_recursors indref_prepath handler_mod_name cstrnames =
     (* let cstrnames = all_handler_names in  *)
-    let the_motive = 
-      let motive_base = 
-        Libnames.qualid_of_ident (Nameops.add_prefix "__motiveT" fname) in
-       _point_qualid_ auxillary_motive_modname motive_base
+    let the_motives = 
+      List.map (fun n ->
+        let motive_base = 
+        Libnames.qualid_of_ident (Nameops.add_prefix "__motiveT" n) in
+       _point_qualid_ auxillary_motive_modname motive_base) fnames
       in 
     let args = cstrnames in 
     let args = List.map (_qualid_point_ (Some (Libnames.qualid_of_ident handler_mod_name))) args in 
-    let args = the_motive :: args in 
+    let args = the_motives @ args in 
     let args = List.map mkRefC args in 
-    let indrec_path = 
-      let _, indtypename = to_qualid_name (fst indref) in 
-      let indrecname = 
-      internal_version_name
-          (Nameops.add_suffix indtypename postfix) in 
-      _qualid_point_ indref_prepath indrecname 
-    in 
-    (mkAppC (mkRefC indrec_path, args)) in 
+    let indnames = List.map Libnames.qualid_basename (fst indrefs) in
+    let indtypename = concat_names indnames in
+    let recursor_names = if List.length fnames > 1 then
+      List.map (fun x -> Nameops.add_prefix (Names.Id.to_string x ^ "_") indtypename) indnames
+      else [indtypename] in
+    List.map (fun n ->
+      let indrecname = internal_version_name (Nameops.add_suffix n postfix) in 
+      let indrec_path = _qualid_point_ indref_prepath indrecname in
+      mkAppC (mkRefC indrec_path, args)) recursor_names in 
   let new_or_extend = 
     if extending then Option.map snd ( top_uninherited_field ()) else None 
     in
   (* deal with the inheritance judgement *)
   ontopinh
   (fun (name, current_inh) ->
-    (name, inhnew_or_extend_fthm current_inh fname new_or_extend raw_recursor handlers_in_mod  compiled_motive indref recty all_handler_names wrapped_recty_in_tm));
+    (name, inhnew_or_extend_fthm current_inh fnames new_or_extend raw_recursors handlers_in_mod compiled_motive indrefs recty all_handler_names wrapped_recty_in_tm));
   claim_goal_info := None
-
-

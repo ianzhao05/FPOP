@@ -151,7 +151,7 @@ in the current family
     | [] -> []
     | _ ->
       let _, (((_, (_, oup)) , _), _) = peek inhcontentref in 
-      List.map fst oup in 
+      List.map fst (expand_ctx oup) in 
   let current_family_member = Set_Name.add_seq (List.to_seq current_family_member) Set_Name.empty in 
   let from_parent : _ list =
     match !inhbasestack with 
@@ -176,7 +176,7 @@ let if_fieldsname_not_defined_yet (fname : name) : bool =
     | [] -> []
     | _ ->
       let _, (((_, (_, oup)) , _), _) = peek inhcontentref in 
-      List.map fst oup in 
+      List.map fst (expand_ctx oup) in 
   let current_family_member = Set_Name.add_seq (List.to_seq current_family_member) Set_Name.empty in 
   not (Set_Name.mem fname current_family_member)
 
@@ -224,15 +224,16 @@ let all_direct_accessible_field (targetctx : family_ctxtype)  : name Dict_Name.t
       | (field_name, CoqIndTy {allnames; _}) :: tail -> 
         (* collect all the name and add them into the name dictionary *)
         List.fold_right (fun eachname d -> Dict_Name.add eachname self_name d) allnames (daff famname tail)
-        
+      | (field_name, RecTy {fnames; _}) :: tail -> 
+        List.fold_right (fun eachname d -> Dict_Name.add eachname self_name d) fnames (daff famname tail)
       | (field_name, _) :: tail -> Dict_Name.add field_name self_name (daff famname tail)  in  
-    with_cache_rec (lru ~eq:(fun a b -> a == b) 64) direct_accessible_field_in_family_ in 
+    with_cache_rec (lru 64) direct_accessible_field_in_family_ in 
   let direct_accessible_field_in_ctx = 
     let direct_accessible_field_in_ctx_ dafc f  : name Dict_Name.t = 
       match f with 
       | [] -> Dict_Name.empty
       | (_, (fname, fty))::tail -> shadow_union (direct_accessible_field_in_family fname fty) (dafc (tail)) in 
-    with_cache_rec (lru ~eq:(fun a b -> a == b) 16) direct_accessible_field_in_ctx_ in 
+    with_cache_rec (lru 16) direct_accessible_field_in_ctx_ in 
   match !inhcontentref with 
   | [] -> Dict_Name.empty
   | _ ->
@@ -312,12 +313,29 @@ let attach_self_prefix_coqindsig (q : CoqIndSigUtil.coq_ind_sig) : CoqIndSigUtil
   in 
   List.map (fun (a,b) -> (attach_self_prefix_coqindsig a, b)) q
 
+let sort_ind_decls (ind_decls : (name * modtyperef * rawterm) list) =
+  let ctx = currentinh_output_ctx () in
+  let (_,indref,_) = List.hd ind_decls in
+  let name_idx_map = match locate_in_fam_type_withself ctx indref with
+  | CoqIndTy {name_groups; _} -> List.mapi (fun i (n,_) -> (n,i)) name_groups
+  | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
+  let get_idx n =
+    try
+      List.assoc (Libnames.qualid_basename n) name_idx_map
+    with Not_found -> cerror ~einfo:"Inductive types must be from the same group!" () in
+  let cmp (i,_) (j,_) =
+    match compare i j with
+    | 0 -> cerror ~einfo:"Found duplicate inductive type!" ()
+    | r -> r in
+  ind_decls |> List.map (fun ((_,n,_) as x) -> (get_idx n, x))
+    |> List.sort cmp
+    |> List.map snd
 
 type plugin_command_scope_kind = 
   FRecursion | FInduction 
   | OpenedFamily | OpenedFieldClaim 
   | OpenedMetadata
-type plugin_command_scope = plugin_command_scope_kind * name * (unit -> unit)
+type plugin_command_scope = plugin_command_scope_kind * name list * (unit -> unit)
 (* the third term is a function responsible for closing, thus called closing handler  *)
 let plugin_command_scopes = Summary.ref ~name:"PluginCommandScope" ([] : plugin_command_scope list)
 
@@ -327,6 +345,15 @@ let peek_scope () : plugin_command_scope option =
   | [] -> None 
   | h :: _ -> Some h 
 
+let print_scope () : unit = 
+  let open Pp in 
+  let _ = 
+    Utils.msg_notice @@
+      (str "Current Scope :") ++
+      (List.fold_left (fun a (_,b,_) -> a ++ (str ",") ++
+        (str (b |> List.map Names.Id.to_string |> String.concat " with ")))
+      (str "") (!plugin_command_scopes))
+  in ()
 
 (* adding the top with scope information (i.e. add another scope) *)
 (* Note that, only OpenedFamily allows nesting, so *)
@@ -338,28 +365,23 @@ let push_scope (p : plugin_command_scope) =
     | _ -> cerror ~einfo:("Not allow nesting except in Family. Please Close the last scope first.") ()
   in 
   plugin_command_scopes := (p :: (!plugin_command_scopes));
-  let _ = 
-    let open Pp in 
-    Utils.msg_notice @@ (str "Current Scope :") ++ pr_list_name (List.map (fun (_, n, _) -> n) (!plugin_command_scopes))
-  in ()
+  print_scope ()
 
 
 
 (* if use_closing_handler = true, then we will use the closing handler
    if verify_name is specified, then we verify the given name  *)
-let pop_scope ?(use_closing_handler = true) verify_name () =
+let pop_scope ?(use_closing_handler = true) verify_names () =
   match (!plugin_command_scopes) with 
   | [] -> cerror ~einfo:("Empty Scope! "^__LOC__) ()
-  | (_,thename,closing_handler)::tail ->
+  | (_,thenames,closing_handler)::tail ->
     begin
-    let real_name = Names.Id.to_string thename in 
-    assert_cerror_forced ~einfo:("Incorrect Scope Name, the last scope is  "^real_name^"  "^__LOC__) (fun _ -> verify_name = thename);
+    let real_name = thenames |> List.map Names.Id.to_string |> String.concat " with " in
+    assert_cerror_forced ~einfo:("Incorrect Scope Name, the last scope is  "^real_name^"  "^__LOC__)
+      (fun _ -> List.sort Names.Id.compare verify_names = List.sort Names.Id.compare thenames);
     if use_closing_handler then closing_handler () else ();
     plugin_command_scopes := tail;
-    let _ = 
-      let open Pp in 
-      Utils.msg_notice @@ (str "Current Scope :") ++ pr_list_name (List.map (fun (_, n, _) -> n) (!plugin_command_scopes))
-    in  ()
+    print_scope ()
     end
 
 

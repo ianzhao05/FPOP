@@ -75,6 +75,11 @@ let llconstr_ip : Constrexpr.constr_expr Pcoq.Entry.t =
 
 let _in_proof_mode _ = Vernacextend.(VtStartProof (Doesn'tGuaranteeOpacity,[]))
 
+let test_second_token_about =
+  let open Pcoq.Lookahead in
+  to_entry "test_second_token_about" begin
+    lk_ident >> lk_kw "about"
+  end
 }
 
 GRAMMAR EXTEND Gram
@@ -93,14 +98,23 @@ GLOBAL: mutind_defs llconstr_ip (*thmbinders*) gallina_ext list1ident reference_
     [[  ]];
 END
 
+ARGUMENT EXTEND induction_decl
+| [ ident(name) "about" reference_ip(indref) "motive" llconstr_ip(motive) ] -> 
+  { name, indref, motive }
+END
+
+ARGUMENT EXTEND induction_decls
+| [ test_second_token_about ne_induction_decl_list_sep(ind_decls, "with") ] -> 
+  { sort_ind_decls ind_decls }
+END
+
 (* llconstr_ip is those constructor that has self__ auto prefixxed *)
 VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
-
 | [ "MetaData" ident(i)  ] -> {
     assert_in_scope OpenedFamily;
     let modname, params = open_meta_data_section i in 
     open_new_module (modname.v) params; 
-    push_scope (OpenedMetadata, i, close_meta_data_section)
+    push_scope (OpenedMetadata, [i], close_meta_data_section)
   }
 
 | [ "Field" ident(fname) ":" llconstr_ip(eT) ] -> {
@@ -109,7 +123,7 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
     (* this is the gathering of FieldClaim Stuff *)
     let modname, params = open_claim_goal_info_prepare tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 | [ "FLemma" ident(fname) ":" llconstr_ip(eT) ] -> {
     assert_in_scope OpenedFamily;
@@ -117,7 +131,7 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
     (* this is the gathering of FieldClaim Stuff *)
     let modname, params = open_claim_goal_info_prepare tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 | [ "Field" ident(fname) ":" llconstr_ip(eT) ":=" llconstr_ip(e)  ] -> { 
   assert_in_scope OpenedFamily;
@@ -141,7 +155,7 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
     let ov_dependencies = Some (fst @@ overridable_names_analyze_to_paths def_depend) in 
     let modname, params = open_claim_goal_info_prepare ~ov_dependencies tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 
 | [ "Overridable" "pins" "{" list1ident(def_depend) "}" "FLemma" 
@@ -152,7 +166,7 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
     let ov_dependencies = Some (fst @@ overridable_names_analyze_to_paths def_depend) in 
     let modname, params = open_claim_goal_info_prepare ~ov_dependencies tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 
 | [ "Overridable" "pins" "{" list1ident(def_depend) "}" "Field" ident(fname) ":" llconstr_ip(eT) ":=" llconstr_ip(e)  ] -> { 
@@ -163,30 +177,31 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
   assert_in_scope OpenedFamily;
   add_overridable_field fname ~eT:(Some eT) ~def_depend e }
 
-| [ "FInduction" ident(fname) "about" reference_ip(indref) "motive"  llconstr_ip(motive) ] ->
-  { 
-    assert_in_scope OpenedFamily;
-    begin match infer_fname_new_or_extend fname with
-    | `New -> open_ftheorem_info_prepare fname motive indref 
-    | `Extend -> open_extend_ftheorem_info_prepare fname
-    end;
-    push_scope (FInduction, fname, close_ftheorem);
-    let modname, params = prepare_proving_ftheorem1 () in
-    open_new_module (modname.v) params; 
-    prepare_proving_ftheorem2 ()
-  } 
-
-| [ "FInduction" ident(fname)] ->
+| [ "FInduction" ne_ident_list_sep(fnames, "with") ] ->
   { 
     assert_in_scope OpenedFamily;
     assert_cerror_forced ~einfo:"Can only omit motive when extending" 
-    (fun _ -> infer_fname_new_or_extend fname = `Extend);
-    open_extend_ftheorem_info_prepare fname;
-    push_scope (FInduction, fname, close_ftheorem);
+      (fun _ -> infer_fname_new_or_extend (List.hd fnames) = `Extend);
+    open_extend_ftheorem_info_prepare fnames;
+    push_scope (FInduction, fnames, close_ftheorem);
     let modname, params = prepare_proving_ftheorem1 () in
     open_new_module (modname.v) params; 
     prepare_proving_ftheorem2 ()
-  } 
+  }
+  
+| [ "FInduction" induction_decls(ind_decls) ] ->
+  { 
+    assert_in_scope OpenedFamily;
+    let fnames, indrefs, motives = split3 ind_decls in
+    begin match infer_fname_new_or_extend (List.hd fnames) with
+    | `New -> open_ftheorem_info_prepare fnames motives indrefs
+    | `Extend -> open_extend_ftheorem_info_prepare fnames
+    end;
+    push_scope (FInduction, fnames, close_ftheorem);
+    let modname, params = prepare_proving_ftheorem1 () in
+    open_new_module (modname.v) params; 
+    prepare_proving_ftheorem2 ()
+  }
 
 (* | [ "Closing" "Fact" ident(fname) ":" llconstr_ip(eT) ":=" llconstr_ip(e) ] -> { asserting_closing_fact fname eT (RawTerm e) }   *)
 (* Don't support proof-relevant Closing Fact from now on *)
@@ -208,42 +223,41 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
 (* deprecate the following *)
 (* | [ "SealFamily" ] -> { inherits_all_remained(); close_current_inh_judgement ~is_sealing:true () } *)
   (* Turn off SealFamily feature *)
-| [ "FRecursor" ident(fname) 
-               "about" reference_ip(indref)
-               "motive" llconstr_ip(motive)
-               "using" reference_ip(rec_mod) 
-               "by" ident(postfix)  ] -> 
+| [ "FRecursor" induction_decls(ind_decls)
+              "using" reference_ip(rec_mod)
+              "by" ident(postfix)  ] ->
   {   assert_in_scope OpenedFamily;
-      add_recursor fname rec_mod motive indref postfix
+      let fnames, indrefs, motives = split3 ind_decls in
+      add_recursor fnames rec_mod motives indrefs postfix
       }
-| [ "FRecursor" ident(fname) 
-               "about" reference_ip(indref)
-               "motive" llconstr_ip(motive)
-               "using" reference_ip(rec_mod) 
-               "by" ident(postfix) "WithRec2D"  ] -> 
+
+| [ "FRecursor" induction_decls(ind_decls)
+              "using" reference_ip(rec_mod)
+              "by" ident(postfix) "WithRec2D" ] ->
   {   assert_in_scope OpenedFamily;
-      add_recursor_and_rec2d fname rec_mod motive indref postfix
+      let fnames, indrefs, motives = split3 ind_decls in
+      add_recursor_and_rec2d fnames rec_mod motives indrefs postfix
       }
 (* | [ "TestProof2" ident(fname) ":" llconstr_ip(eT) "by" "{" tactic(t) "}" ] -> { test_proof2 fname eT t }   *)
 
-| [ "FRecursion" ident(fname) 
-               "about" reference_ip(indref)
-               "motive" llconstr_ip(motive)
+| [ "FRecursion" ne_ident_list_sep(fnames, "with")   ] -> 
+  { 
+    assert_in_scope OpenedFamily;
+    push_scope (FRecursion, fnames, FRecursionSugar.close_frecursion_block);
+    match infer_fname_new_or_extend (List.hd fnames) with 
+    | `New -> cerror ~einfo:("Only Extension can omit parameters!"^__LOC__) ()
+    | `Extend -> FRecursionSugar.extend_frecursion_block fnames
+  }
+
+| [ "FRecursion" induction_decls(ind_decls)
                "by" ident(postfix)  ] -> 
   { 
     assert_in_scope OpenedFamily;
-    push_scope (FRecursion, fname, FRecursionSugar.close_frecursion_block);
-    match infer_fname_new_or_extend fname with 
-    | `New -> FRecursionSugar.start_frecursion_block fname motive indref postfix
-    | `Extend -> FRecursionSugar.extend_frecursion_block fname
-  }
-| [ "FRecursion" ident(fname)   ] -> 
-  { 
-    assert_in_scope OpenedFamily;
-    push_scope (FRecursion, fname, FRecursionSugar.close_frecursion_block);
-    match infer_fname_new_or_extend fname with 
-    | `New -> cerror ~einfo:("Only Extension can omit parameters!"^__LOC__) ()
-    | `Extend -> FRecursionSugar.extend_frecursion_block fname
+    let fnames, indrefs, motives = split3 ind_decls in
+    push_scope (FRecursion, fnames, FRecursionSugar.close_frecursion_block);
+    match infer_fname_new_or_extend (List.hd fnames) with 
+    | `New -> FRecursionSugar.start_frecursion_block fnames motives indrefs postfix
+    | `Extend -> FRecursionSugar.extend_frecursion_block fnames
   }
 
 | [ "Case" ident(fname) ":=" constr(tm) ] -> 
@@ -279,7 +293,7 @@ VERNAC COMMAND EXTEND FamilyPolyEntry CLASSIFIED AS SIDEFF
 
 
 (* Change to generic scope ending *)
-| [ "FEnd" ident(scope_name) ] -> {   pop_scope scope_name () }
+| [ "FEnd" ne_ident_list_sep(scope_names, "with") ] -> {   pop_scope scope_names () }
 (* | [ "EndMetaData" ] -> { close_meta_data_section () } *)
 (* | [ "EndFamily" ] -> { inherits_all_remained(); close_current_inh_judgement() } *)
 (* | [ "EndFieldClaim" ] -> { close_claim_and_collect_claim_goal_info () } *)
@@ -312,7 +326,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
 | [ "Family" ident(fname) "extends" ident(bname)]  -> { 
     assert_in_empty_scope ();
     open_new_inhjudgement ~bname:(Some bname) fname;
-    push_scope (OpenedFamily, fname, (fun _ -> (inherits_all_remained(); close_current_inh_judgement())))
+    push_scope (OpenedFamily, [fname], (fun _ -> (inherits_all_remained(); close_current_inh_judgement())))
     }
 
 (* Legacy as well, we do the inference *)
@@ -327,7 +341,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
   | `New -> open_new_inhjudgement fname
   | `Extend ->  assert_in_scope OpenedFamily; extend_new_nested_inhjudgement fname
   end;
-  push_scope (OpenedFamily, fname, (fun _ -> (inherits_all_remained(); close_current_inh_judgement()))); 
+  push_scope (OpenedFamily, [fname], (fun _ -> (inherits_all_remained(); close_current_inh_judgement()))); 
   }
 
 
@@ -350,7 +364,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
     let ov_dependencies = Some (fst @@ overridable_names_analyze_to_paths def_depend) in 
     let modname, params = override_open_claim_goal_info_prepare ~ov_dependencies tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 | [ "Override" "Field" ident(fname) ":" llconstr_ip(eT)  ] -> {
     assert_in_scope OpenedFamily;
@@ -360,7 +374,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
     let ov_dependencies = Some (fst @@ overridable_names_analyze_to_paths def_depend) in 
     let modname, params = override_open_claim_goal_info_prepare ~ov_dependencies tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 | [ "Override" "pins" "{" list1ident(def_depend) "}" "FLemma" ident(fname) ":" llconstr_ip(eT)  ] -> {
     assert_in_scope OpenedFamily;
@@ -369,7 +383,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
     let ov_dependencies = Some (fst @@ overridable_names_analyze_to_paths def_depend) in 
     let modname, params = override_open_claim_goal_info_prepare ~ov_dependencies tbinders in
     open_new_module (modname.v) params; 
-    push_scope (OpenedFieldClaim, fname, close_claim_and_collect_claim_goal_info)
+    push_scope (OpenedFieldClaim, [fname], close_claim_and_collect_claim_goal_info)
   }
 
 (* Now Override can only apply to overridable term
@@ -402,7 +416,7 @@ VERNAC COMMAND EXTEND FamilyPolyExtension CLASSIFIED AS SIDEFF
 | [ "Family" ident(newfname) "extends" ident(basename) "using" ident(inhname1) "using" ident(inhname2) "Begin"]
 -> {
       start_completing_mixin newfname basename inhname1 inhname2;
-      push_scope (OpenedFamily, newfname, (fun _ -> (inherits_all_remained(); close_current_inh_judgement())))
+      push_scope (OpenedFamily, [newfname], (fun _ -> (inherits_all_remained(); close_current_inh_judgement())))
       (* () *)
     }
 END

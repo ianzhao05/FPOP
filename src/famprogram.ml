@@ -20,8 +20,7 @@ open Finh
 
 
 (* TODO : refactoring the guarding code to here *)
-let only_support_one_ind_no_binder (inddef : coq_ind_sig) : unit = 
-  assert_cerror ~einfo:"FRecursor doesn't support mutual inductive type yet" (fun _ ->List.length inddef = 1);
+let only_support_no_binder (inddef : coq_ind_sig) : unit = 
   let s = fst (List.hd inddef) in 
   let (indtypename, ind_params, indtype, cstrlist) = s in 
   assert_cerror ~einfo:"FLemma doesn't support Inductive Parameter yet" (fun _ ->fst ind_params = [] && snd ind_params = None)
@@ -29,7 +28,7 @@ let only_support_one_ind_no_binder (inddef : coq_ind_sig) : unit =
 
 let add_ind_defs (e : coq_ind_sig)  : unit =
   assert_current_has_open_judgement();
-  only_support_one_ind_no_binder e;
+  only_support_no_binder e;
   let allname = extract_all_ident [e] in
   if_allow_new_fields allname;
   let indgroupname = List.hd allname in 
@@ -58,37 +57,38 @@ let add_ind_defs (e : coq_ind_sig)  : unit =
     Check Indrec.mli for helper function
   *)
 (* TODO : directly use Coq's Scheme command instead of error-pronely calling _rect *)
-let add_recursor (fname : name) 
-    (rec_mod : Libnames.qualid) 
-    (motive : rawterm) 
-    (indtype : Libnames.qualid) 
-    (postfix : name) = 
+
+let add_recursor
+  (fnames : name list)
+  (rec_mod : Libnames.qualid) 
+  (motives : rawterm list)
+  (indtypes : Libnames.qualid list) 
+  (postfix : name) = 
   assert_current_has_open_judgement();
-  if_allow_new_field fname;
+  if_allow_new_fields fnames;
   let current_ctx = currentinh_output_ctx() in 
   let postfix = Names.Id.to_string postfix in
   let parameters = famctx_to_parameters_selfprefix current_ctx in
-  let _ = 
-    let _, basename = to_qualid_name rec_mod in 
-    let basename = Names.Id.to_string basename in 
-    assert_cerror_forced ~einfo:"Recursor Module must be named ending with `cases`, `handler`, or `internal`" 
+  let _ =
+    let _, basename = to_qualid_name rec_mod in
+    let basename = Names.Id.to_string basename in
+    assert_cerror_forced ~einfo:"Recursor Module must be named ending with `cases`, `handler`, or `internal`"
     (fun _ -> is_rec_handler basename)
   in
-  (* Construct typed motive *)
-  let motive : coqterm = 
-    let open CoqVernacUtils in 
+  let motives =
+    let open CoqVernacUtils in
     ModTerm (runVernac @@
-    define_module (freshen_name ~prefix:(Nameops.add_prefix "__motive_of_" fname) ()) parameters 
+    define_module (freshen_name ~prefix:(Names.Id.of_string ("__motive_of_" ^
+      (String.concat "_" (List.map Names.Id.to_string fnames)))) ()) parameters
     (fun ctx ->
-      define_term (Nameops.add_prefix "__motiveT" fname) motive
-      ))
-  in 
+      flatmap (List.map (fun (fname, motive) ->
+        define_term (Nameops.add_prefix "__motiveT" fname) motive
+      ) (List.combine fnames motives))
+    ))
+  in
   ontopinh
   (fun (name, current_inh) ->
-    (name, inhnewrec current_inh fname current_ctx (rec_mod, current_ctx) (motive, current_ctx) (indtype, current_ctx) postfix) )
-
-
-
+    (name, inhnewrec current_inh fnames current_ctx (rec_mod, current_ctx) (motives, current_ctx) (indtypes, current_ctx) postfix) )
 
 (* Now closing fact has a concrete semantic
     it is 
@@ -288,7 +288,7 @@ let close_current_inh_judgement ?(is_sealing = false) () : unit =
   | Nested {orig = orgbasis; shifted = (expected_basis, _); ov_exposed=(ov_exposed, _)} ->
       (* we are constructing inhextendinh *)
       assert_cerror ~einfo:"Currently Nested Extension doesn't allow " (fun _ -> not is_sealing);
-      assert_cerror ~einfo:"Unfinished Inh Judgement." (fun _ ->current_basis = expected_basis);
+      (* assert_cerror ~einfo:"Unfinished Inh Judgement." (fun _ ->current_basis = expected_basis); *)
       assert_cerror ~einfo:"Expect Non-Empty inhbasestack" (fun _ ->List.length !inhbasestack > 1);
 
       (* TODO : Check 2.b *)
@@ -804,62 +804,68 @@ let add_prec (fname : name)
   assert_current_has_open_judgement ();
   if_allow_new_field fname;
   let current_ctx = currentinh_output_ctx() in 
-  let inddef, prec_register_point = 
+  let inddef, prec_register_point, name_groups = 
     let t = locate_in_fam_type_withself current_ctx indref in 
     match t with 
-    | CoqIndTy {indsigs_from_org_ctx; registered_prec; _}-> indsigs_from_org_ctx, registered_prec
+    | CoqIndTy {indsigs_from_org_ctx; registered_prec; name_groups; _} ->
+      indsigs_from_org_ctx, registered_prec, name_groups
     | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
-  let validcstrs = extract_cstrs_ident (fst inddef) in 
-    ontopinh
-    (fun (name, current_inh) ->
-      (name, inhnewprec current_inh fname indref validcstrs));
-    (* register the name of prec, used by fdiscriminate *)
-    prec_register_point := Some fname
+  let indname = Libnames.qualid_basename indref in
+  let validcstrs = List.assoc indname name_groups in
+  ontopinh
+  (fun (name, current_inh) ->
+    (name, inhnewprec current_inh fname indref validcstrs));
+  (* register the name of prec, used by fdiscriminate *)
+  prec_register_point := (indname, fname) :: !prec_register_point
 
 
-let add_rec2d ?(fname = (None : name option)) 
-~(recursorref : fieldpath) ()
-(* ~(indref : fieldpath)  *)
+let add_rec2d ?(fnames = (None : name list option)) 
+~(recursorrefs : fieldpath list) ()
 = 
 assert_current_has_open_judgement ();
-let fname = 
-  match fname with 
+let fnames = 
+  match fnames with 
   | None ->   
-  let _, basename = to_qualid_name recursorref in 
-  let rec2dname = freshen_name ~prefix:(Nameops.add_prefix "RComp回" basename) () in  
-  rec2dname 
-  | Some fname -> fname
+    List.map (fun r ->
+      let _, basename = to_qualid_name r in 
+    let rec2dname = freshen_name ~prefix:(Nameops.add_prefix "RComp回" basename) () in  
+    rec2dname) recursorrefs
+  | Some fnames -> fnames
 in 
-if_allow_new_field fname;
+if_allow_new_fields fnames;
 let current_ctx = currentinh_output_ctx() in 
-let indref = 
+let indrefs = 
   let _ = 
     let open Pp in 
-    Utils.msg_notice @@ (str "Trying to find") ++ Libnames.pr_qualid recursorref 
+    Utils.msg_notice @@ (str "Trying to find: ") ++ Libnames.pr_qualid (List.hd recursorrefs)
   in 
-  let t = locate_in_fam_type_withself current_ctx recursorref in 
+  let t = locate_in_fam_type_withself current_ctx (List.hd recursorrefs) in 
   match t with 
-  | PRecTy {inductivedef = inductivedef, _; _} 
-  | RecTy {inductivedef; _} -> inductivedef
+  | PRecTy {inductivedef = inductivedef, _; _}  -> [inductivedef]
+  | RecTy {inductivedefs; _} -> inductivedefs
   | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
   ontopinh
   (fun (name, current_inh) ->
-    (name, inhnewrec2d current_inh fname recursorref indref))
+    (name, inhnewrec2d current_inh fnames recursorrefs indrefs))
 
-let add_rec2d_on (recursorref : name) = 
-  let recursorref =  match current_family_name () with 
+let add_rec2d_on (recursorrefs : name list) = 
+  let recursorrefs =  match current_family_name () with 
   | None -> cerror ~einfo:"Supposed to be in a family!" () 
-  | Some current_family_name -> _point_qualid_ ((self_version_name current_family_name)) (Libnames.qualid_of_ident recursorref) in 
-  add_rec2d ~recursorref ()
+  | Some current_family_name ->
+    List.map (fun r -> _point_qualid_ ((self_version_name current_family_name)) (Libnames.qualid_of_ident r)) recursorrefs in 
+  add_rec2d ~recursorrefs ()
 
-let add_recursor_and_rec2d fname rec_mod motive indref postfix = 
-  add_recursor fname rec_mod motive indref postfix;
-  add_rec2d_on fname
+let add_recursor_and_rec2d fnames rec_mod motives indrefs postfix = 
+  add_recursor fnames rec_mod motives indrefs postfix;
+  add_rec2d_on fnames
 
+(* let add_mut_recursor_and_rec2d fnames rec_mod motives indrefs postfix =
+  add_mut_recursor fnames rec_mod motives indrefs postfix *)
+  
 let add_prec_and_rec2d (fname : name) 
 (indref : fieldpath) = 
   add_prec fname indref;
-  add_rec2d_on fname 
+  add_rec2d_on [fname] 
 
 
 
@@ -927,16 +933,18 @@ let do_frec_eval (recref : Evd.econstr) : unit Proofview.tactic =
     Utils.msg_notice @@ (str "recursor path:") ++ Libnames.pr_qualid recref in  
   let current_ctx = currentinh_output_ctx () in 
   let recty = locate_in_fam_type_withself current_ctx recref in 
-  let inddef, _ = 
+  let indref = 
     match recty with 
-    | RecTy {inductivedef; _}  
+    | RecTy {inductivedefs; fnames; _} ->
+      List.assoc (Libnames.qualid_basename recref) (List.combine fnames inductivedefs)
     | PRecTy {inductivedef = inductivedef, _; _} -> 
-      (let indty = locate_in_fam_type_withself current_ctx inductivedef in 
-       match indty with 
-       | CoqIndTy {indsigs_from_org_ctx; _} -> indsigs_from_org_ctx , inductivedef
-       | _ -> cerror ~einfo:"Incorrect Type, should be an inductive type" ())
+      inductivedef
     | _ -> cerror ~einfo:"Should refer to a recursor/partial recursor!" () in
-  let all_cstrs = extract_cstrs_ident (fst inddef) in 
+  let all_cstrs =
+    match locate_in_fam_type_withself current_ctx indref with 
+    | CoqIndTy {name_groups; _} ->
+      List.assoc (Libnames.qualid_basename indref) name_groups
+    | _ -> cerror ~einfo:"Incorrect Type, should be an inductive type" () in
   let all_rewrite_eqs = 
     List.map (
       fun each_cstr ->
@@ -1008,9 +1016,9 @@ let fdiscriminate_by  (h : name) (typ : Evd.econstr) : unit Proofview.tactic =
     let prec_name = 
       let t = locate_in_fam_type_withself current_ctx indref in 
       match t with 
-      | CoqIndTy {registered_prec; _}-> !registered_prec
+      | CoqIndTy {registered_prec; _}-> List.assoc_opt (Libnames.qualid_basename indref) !registered_prec
       | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
-    let prec_name = 
+    let prec_name =
         match prec_name with
         | None -> cerror ~einfo:("Expect Registered Partial Recursor for "^ Libnames.string_of_qualid indref) ()
         | Some prec_name -> prec_name in
@@ -1055,11 +1063,18 @@ module FRecursionSugar = struct
 (* let frecursion_defined_handlers = nonimplement () *)
 let frecursion_handler_type : rawterm Dict_Name.t option ref = Summary.ref ~name:"FRecursionHandlerTypes" None 
 
-type frecursion_config = {new_or_extend : [`New | `Extend] ; fname : name; motive : rawterm; indtype : fieldpath; postfix : name; outside_family_name : name}
+type frecursion_config = {
+  new_or_extend : [`New | `Extend];
+  fnames : name list;
+  motives : rawterm list;
+  indtypes : fieldpath list;
+  postfix : name;
+  outside_family_name : name
+}
 let frecursion_config_record : frecursion_config option ref = Summary.ref ~name:"FRecursionConfiguration" None 
 
 let handler_suffix fname = Nameops.add_suffix fname "_handler"
-let _motive = (Names.Id.of_string "_motive")
+let motive_name_of fname = Nameops.add_suffix fname "_motive"
 
 
 (* helper function, not supposed to be used outside
@@ -1067,16 +1082,18 @@ let _motive = (Names.Id.of_string "_motive")
    we include the recursor handler type into a new module (with a new name) (into the current ctx)
    called handlers_mod_name into the current context
    also return all the constructor *)
-let include_recursor_handler_type (fname : name) (indtype : fieldpath) (postfix : string) = 
+let include_recursor_handler_type (fname : name) (indtypes : fieldpath list) (postfix : string) = 
   (* Setup frecursion_handler_type, frecursion_config_record *)
   let current_ctx = currentinh_output_ctx () in 
   let inddef = 
-    let t = locate_in_fam_type_withself (currentinh_output_ctx()) indtype in 
+    let t = locate_in_fam_type_withself (currentinh_output_ctx()) (List.hd indtypes) in 
     match t with 
     | CoqIndTy {indsigs_from_org_ctx; _}-> indsigs_from_org_ctx
     | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
   let _, inddef_and_recursor_handlers = inductive_to_famterm_and_recursor_type inddef in 
-  let (_, _ctx), all_recur_handler_types_smap = smap_assoc ~einfo:__LOC__ postfix inddef_and_recursor_handlers  in 
+  (* let inddef_and_recursor_handlers = List.map (fun ((_,s),r) -> s,r) inddef_and_recursor_handlers in *)
+  let indnames = List.map Libnames.qualid_basename indtypes in
+  let (_, _ctx), all_recur_handler_types_smap = smap_assoc ~einfo:__LOC__ (indnames, postfix) inddef_and_recursor_handlers  in 
   (* we first gather all the handlers, and wrap them into one module *)
   let (all_recur_handler_types, handlers_mod_name) : (coqterm typed) * name = 
     let handlers_mod_name = freshen_name ~prefix:fname () in 
@@ -1111,80 +1128,92 @@ let include_recursor_handler_type (fname : name) (indtype : fieldpath) (postfix 
    the idea is that, for the handler included in the above function, they are without motive
    this one when inclusion happens, will include motive
    *)
-let prepare_frecursion_handler_type ~_motive_path ~current_family_name ~handlers_mod_name ~each_handler_name = 
-  let motive_term = Constrexpr_ops.mkRefC _motive_path in 
+let prepare_frecursion_handler_type ~_motive_paths ~current_family_name ~handlers_mod_name ~each_handler_name = 
+  let motive_terms = List.map Constrexpr_ops.mkRefC _motive_paths in 
   let proper_prefix t = _point_qualid_ (self_version_name current_family_name) @@ _point_qualid_ handlers_mod_name @@ (Libnames.qualid_of_ident (Nameops.add_prefix ("__handler_type_") t)) in 
   let rec_handler_type_of t = 
     Constrexpr_ops.mkAppC
-    ((Constrexpr_ops.mkRefC (proper_prefix t)), [motive_term]) in 
+    ((Constrexpr_ops.mkRefC (proper_prefix t)), motive_terms) in 
   let each_cstr_rec_handler = List.map (fun (a) -> (a, rec_handler_type_of a)) each_handler_name in 
   let each_cstr_rec_handler = Dict_Name.add_seq (List.to_seq each_cstr_rec_handler) Dict_Name.empty in 
   frecursion_handler_type := Some each_cstr_rec_handler
 
 let start_frecursion_block 
-    (fname : name)  
-    (motive : rawterm) 
-    (indtype : fieldpath) 
+    (fnames : name list)  
+    (motives : rawterm list) 
+    (indtypes : fieldpath list) 
     (postfix_ : name) : unit = 
     assert_current_has_open_judgement ();
     (* let's make sure all the scope manipulation happens in the mlg file *)
     (* assert_in_scope OpenedFamily; *)
+    let fname = List.hd fnames in
     let fname_handler = handler_suffix fname in 
     let outside_family_name = fst (peek inhcontentref) in 
-    if_allow_new_fields ([fname; fname_handler]);
-    open_new_inhjudgement fname_handler; 
-    add_new_field _motive motive;
+    if_allow_new_fields (fname_handler :: fnames);
+    open_new_inhjudgement fname_handler;
+    let motive_names = List.map motive_name_of fnames in
+    List.iter (fun (n, m) -> add_new_field n m) (List.combine motive_names motives);
 
     (* Now we prepare frecursion_handler_type *)
     let postfix = Names.Id.to_string postfix_ in
     let current_family_name = fname_handler in 
-    let _motive_path : fieldpath = _point_qualid_ (self_version_name current_family_name) @@ Libnames.qualid_of_ident _motive in 
-    let handlers_mod_name, each_handler_name = include_recursor_handler_type fname indtype postfix in 
-    prepare_frecursion_handler_type ~_motive_path ~current_family_name ~handlers_mod_name ~each_handler_name;
-    let motive_from_outside = 
+    let _motive_paths = List.map (fun m ->
+      _point_qualid_ (self_version_name current_family_name) @@ Libnames.qualid_of_ident m) motive_names in
+    let handlers_mod_name, each_handler_name = include_recursor_handler_type fname indtypes postfix in 
+    prepare_frecursion_handler_type ~_motive_paths ~current_family_name ~handlers_mod_name ~each_handler_name;
+    let motives_from_outside = List.map (fun m ->
       let motive_from_outside_path = 
         _point_qualid_ (self_version_name outside_family_name)
-          @@ _point_qualid_ (current_family_name) @@ Libnames.qualid_of_ident _motive  
+          @@ _point_qualid_ current_family_name @@ Libnames.qualid_of_ident m  
       in 
-      Constrexpr_ops.mkRefC motive_from_outside_path 
+      Constrexpr_ops.mkRefC motive_from_outside_path) motive_names
     in 
     (* Then we construct frecursion_config_record *)    
-    frecursion_config_record := Some { new_or_extend = `New; fname; motive = motive_from_outside; indtype ; postfix = postfix_ ; outside_family_name}
+    frecursion_config_record := Some {
+      new_or_extend = `New; fnames;
+      motives = motives_from_outside; indtypes;
+      postfix = postfix_ ; outside_family_name}
 
-let extend_frecursion_block (fname : name) : unit = 
+let extend_frecursion_block (fnames : name list) : unit = 
   (* TODO: do some sanity check *)
+  let fname = List.hd fnames in
   let fname_handler = handler_suffix fname in
   let outside_family_name = fst (peek inhcontentref) in 
   (* get ind type and information first *)
   let (_, parent_family_ty), _ = 
     get_family_ty_in_inhbase (dummy_famname) (peek inhbasestack, (currentinh_output_ctx ())) 
   in 
-  let indtype, postfix = 
+  let indtypes, indctx, postfix = 
     let fname_ty =  locate_in_fam_type parent_family_ty [fname] in 
     match fname_ty with 
-    | RecTy {inductivedef; postfix; motive; _} -> (inductivedef, snd motive), postfix 
+    | RecTy {inductivedefs; postfix; motive = (_, ctx); _} -> inductivedefs, ctx, postfix 
     | _ -> cerror ~einfo:("Can only extend parent FRecursion "^__LOC__) ()  
   in 
-  let indtype = wkinh_path indtype (currentinh_output_ctx()) in 
+  let indtypes = List.map (fun t -> fst @@ wkinh_path (t, indctx) (currentinh_output_ctx())) indtypes in 
   (* let's make sure all the scope manipulation happens in the mlg file *)
   (* assert_in_scope OpenedFamily; *)
   extend_new_nested_inhjudgement fname_handler;
   (* inherit the _motive *)
-  add_inherited_fields_until_and_including _motive;
+  let motive_names = List.map motive_name_of fnames in
+  add_inherited_fields_until_and_including (List.hd (List.rev motive_names));
   (* Setup frecursion_handler_type, frecursion_config_record *)
   let current_family_name = fname_handler in 
-  let _motive_path : fieldpath = _point_qualid_ (self_version_name current_family_name) @@ Libnames.qualid_of_ident _motive in 
-  let handlers_mod_name, each_handler_name = include_recursor_handler_type fname (fst indtype) postfix in 
-  prepare_frecursion_handler_type ~_motive_path ~current_family_name ~handlers_mod_name ~each_handler_name;
-  let motive_from_outside = 
+  let _motive_paths = List.map (fun m ->
+    _point_qualid_ (self_version_name current_family_name) @@ Libnames.qualid_of_ident m) motive_names in
+  let handlers_mod_name, each_handler_name = include_recursor_handler_type fname indtypes postfix in 
+  prepare_frecursion_handler_type ~_motive_paths ~current_family_name ~handlers_mod_name ~each_handler_name;
+  let motives_from_outside = List.map (fun m ->
     let motive_from_outside_path = 
       _point_qualid_ (self_version_name outside_family_name)
-        @@ _point_qualid_ (current_family_name) @@ Libnames.qualid_of_ident _motive  
+        @@ _point_qualid_ current_family_name @@ Libnames.qualid_of_ident m  
     in 
-    Constrexpr_ops.mkRefC motive_from_outside_path in
+    Constrexpr_ops.mkRefC motive_from_outside_path) motive_names
+  in
   (* Then we construct frecursion_config_record *)    
-  frecursion_config_record := Some { new_or_extend = `Extend; fname; motive = motive_from_outside; indtype = fst indtype ; postfix = Names.Id.of_string postfix; outside_family_name}
-
+  frecursion_config_record := Some {
+    new_or_extend = `Extend; fnames;
+    motives = motives_from_outside; indtypes;
+    postfix = Names.Id.of_string postfix; outside_family_name}
 
 let add_frecursion_handler (fname : name) (t : rawterm) = 
   assert_current_has_open_judgement ();
@@ -1228,23 +1257,24 @@ let add_frecursion_handler (fname : name) (t : rawterm) =
 
 let close_frecursion_block () = 
   assert_current_has_open_judgement ();
-  let fname, new_or_extend, motive, indtype, postfix, outside_family_name = 
+  let fnames, new_or_extend, motives, indtypes, postfix, outside_family_name = 
     match !frecursion_config_record with 
-    | Some {fname; new_or_extend; motive; indtype; postfix; outside_family_name; _} -> fname, new_or_extend, motive, indtype, postfix, outside_family_name
+    | Some {fnames; new_or_extend; motives; indtypes; postfix; outside_family_name; _} ->
+      fnames, new_or_extend, motives, indtypes, postfix, outside_family_name
     | None -> cerror ~einfo:("Not in any FRecursion scope! "^__LOC__ )() 
   in 
   begin match new_or_extend with 
   | `Extend ->
       inherits_all_remained(); 
       close_current_inh_judgement();
-      add_inherited_fields_until_and_including fname;
+      add_inherited_fields_until_and_including (List.hd fnames);
   | `New -> 
       close_current_inh_judgement();
       (* add_recursor fname rec_mod motive indref postfix *)
       let outside_family_name_self = Libnames.qualid_of_ident (self_version_name outside_family_name) in 
-      let fhandler_name = handler_suffix fname in 
+      let fhandler_name = handler_suffix (List.hd fnames) in 
       let rec_mod = _qualid_point_ (Some (outside_family_name_self)) fhandler_name in 
-      add_recursor_and_rec2d fname rec_mod motive indtype postfix
+      add_recursor_and_rec2d fnames rec_mod motives indtypes postfix
   end;
   (* Now we clean up the two data structure *)
   frecursion_handler_type := None;

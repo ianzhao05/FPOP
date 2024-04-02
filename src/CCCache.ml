@@ -9,10 +9,9 @@ open Utils
 
 (** {1 Caches} *)
 
-type 'a equal = 'a -> 'a -> bool
-type 'a hash = 'a -> int
+type 'a compare = 'a -> 'a -> int
 
-let default_hash_ = Hashtbl.hash
+let default_cmp_ = Stdlib.compare
 
 (** {2 Value interface} *)
 
@@ -73,7 +72,7 @@ let dummy =
 
 module type ContentTy = sig
   type t
-
+  val cmp : t compare
 end
 
 
@@ -81,7 +80,7 @@ module LRU (X:ContentTy) = struct
   (* We use two  *)
   module MapX = Map.Make(
     struct type t = X.t 
-    let compare x y = Stdlib.compare x y 
+    let compare = X.cmp
   end)
 
   type timestamp = int
@@ -179,9 +178,10 @@ end
 
 
 
-let lru (type a) ~eq ?(hash = default_hash_) size =
+let lru (type a) ?(cmp = default_cmp_) size =
   let module L = LRU (struct
     type t = a
+    let cmp = cmp
   end) in
   let c = L.make size in
   {
@@ -226,6 +226,3 @@ let with_cache_rec2 h
     | `Right y -> y 
     | _ -> cerror ~einfo:__LOC__ ()  in 
   (cf1, cf2)
-
-
-

@@ -12,8 +12,7 @@
     for more details.
     @since 0.6 *)
 
-    type 'a equal = 'a -> 'a -> bool
-    type 'a hash = 'a -> int
+    type 'a compare = 'a -> 'a -> int
     
     (** {2 Value interface}
     
@@ -82,7 +81,7 @@
     val dummy : ('a, 'b) t
     (** Dummy cache, never stores any value. *)
     
-    val lru : eq:'a equal -> ?hash:'a hash -> int -> ('a, 'b) t
+    val lru : ?cmp:'a compare -> int -> ('a, 'b) t
     (** LRU cache of the given size ("Least Recently Used": keys that have not been
         used recently are deleted first). Never grows wider than the given size. *)
 

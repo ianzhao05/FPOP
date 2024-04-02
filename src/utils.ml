@@ -28,8 +28,8 @@ type safecoqterm = Constr.constr  (* alias here *)
 type rawterm = Constrexpr.constr_expr
 
 let compare_qualid (x : Libnames.qualid) y =
-  let x = Pp.string_of_ppcmds (Libnames.pr_qualid x) in 
-  let y = Pp.string_of_ppcmds (Libnames.pr_qualid y) in 
+  let x = Libnames.string_of_qualid x in 
+  let y = Libnames.string_of_qualid y in 
   String.compare x y
 
 type modtermref = Libnames.qualid 
@@ -217,23 +217,21 @@ type 'a customized =
 let rec emit_vernac_exprs (ls : Vernacexpr.vernac_expr customized list) : unit =
   
   let emit_vernac_expr ?(on_silence=false) (orgexpr : Vernacexpr.vernac_expr) : unit =
-    let _ = msg_notice @@ 
-      let open Pp in 
-      (Ppvernac.pr_vernac_expr orgexpr) ++ (str ".") in 
     let open Vernacexpr in 
     let expr = {control = []; attrs = []; expr = orgexpr} in 
     let expr = CAst.make expr in 
     let backtrace = Printexc.raw_backtrace_to_string @@ Printexc.get_callstack 5 in 
     let dummyst = Vernacstate.freeze_interp_state ~marshallable:false in 
     try 
-      let _ = Vernacinterp.interp ~st:dummyst expr in () 
+      let _ = Vernacinterp.interp ~st:dummyst expr in
+      msg_notice @@ let open Pp in (Ppvernac.pr_vernac_expr orgexpr) ++ (str ".")
     with reraise ->
-      let info = "Exception Info: " ^ Printexc.to_string reraise ^ "\n" ^ (Pp.string_of_ppcmds @@ CErrors.print reraise) ^ "\n\n" in 
+      if on_silence then Vernacstate.unfreeze_interp_state dummyst
+      else
+        let info = "Exception Info: " ^ Printexc.to_string reraise ^ "\n" ^ (Pp.string_of_ppcmds @@ CErrors.print reraise) ^ "\n\n" in 
         let ver_exc = "Error Happens during translation\n   " ^ (Pp.string_of_ppcmds @@  Ppvernac.pr_vernac_expr orgexpr) ^ "\n" in 
         let stack_info = backtrace in 
-        if on_silence 
-        then ()
-        else cerror ~einfo:(info ^ ver_exc ^ "Stack Trace \n" ^ stack_info ^ "\n") () in 
+        cerror ~einfo:(info ^ ver_exc ^ "Stack Trace \n" ^ stack_info ^ "\n") () in 
   
   let emit_customized_vernac_expr (exp : Vernacexpr.vernac_expr customized) : unit =
     match exp with 
@@ -481,7 +479,8 @@ let wrap_modtype_into_module_modtype
         )
 
 
-
+let concat_names names =
+  Names.Id.of_string (String.concat "_" (List.sort String.compare (List.map Names.Id.to_string names)))
 
 (* Given 
     Module A (ctxs : Ctxs ...). End A. 
@@ -736,6 +735,13 @@ match expose with
 
 type 'a stack = 'a list
 
+let iter_combs f l : unit =
+  let n = List.length l in
+  assert_cerror_forced ~einfo:"Too many elements" (fun _ -> n <= 10);
+  for i = 0 to (1 lsl n) do
+    f (List.filteri (fun j _ -> (i lsr j) land 1 = 1) l)
+  done
+
 module CoqIndSigUtil = struct
 
 type coq_ind_sig = (Vernacexpr.inductive_expr * Vernacexpr.decl_notation list) list
@@ -756,32 +762,29 @@ let extract_type_and_cstrs (s : Vernacexpr.inductive_expr) : ((name * (rawterm o
   | Vernacexpr.Constructors cstrlist -> (indtypename, indtype), (List.map each_constr cstrlist)
   | _ -> cerror ~einfo:"Incorrect Inductive Signature" ()
 
-let extract_all_ident (inddef : coq_ind_sigs) : name list = 
-  (* TODO: deal with all the coqindsig later *)
-  let inddef = List.hd inddef in 
-  let allnames = List.map (fun k -> extract_type_and_cstrs @@ fst k) inddef in 
-  let typenames = List.map (fun x -> fst (fst x)) allnames in 
-  let cstnames = List.map fst @@ List.concat_map snd allnames in 
-  let allname = typenames @ cstnames in 
-  allname
+let extract_groups_ident (inddef : coq_ind_sigs) : (name * name list) list =
+  let inddef = List.hd inddef in
+  let allnames = List.map (fun k -> extract_type_and_cstrs @@ fst k) inddef in
+  let name_groups = List.map (fun (x, y) -> (fst x), (List.map fst y)) allnames in
+  name_groups
 
+let extract_all_ident (inddef : coq_ind_sigs) : name list = 
+  List.concat_map ((fun (x, y) -> x :: y)) (extract_groups_ident inddef)
 
 let extract_type_ident (inddef : coq_ind_sigs) : name list = 
-  (* TODO: deal with all the coqindsig later *)
-  let inddef = List.hd inddef in 
-  let allnames = List.map (fun k -> extract_type_and_cstrs @@ fst k) inddef in 
-  let typenames = List.map (fun x -> fst (fst x)) allnames in 
-  typenames
+  List.map fst (extract_groups_ident inddef)
 
 let extract_cstrs_ident (inddef : coq_ind_sigs) : name list = 
-  (* TODO: deal with all the coqindsig later *)
-  let inddef = List.hd inddef in 
-  let allnames = List.map (fun k -> extract_type_and_cstrs @@ fst k) inddef in 
-  let cstrnames = List.concat_map (fun x -> List.map fst (snd x)) allnames in 
-  cstrnames
-
+  List.concat_map snd (extract_groups_ident inddef)
 end
 
+let split3 lst =
+  let rec h lst a1 a2 a3 =
+    match lst with
+    | [] -> (List.rev a1, List.rev a2, List.rev a3)
+    | (x1, x2, x3) :: tl -> h tl (x1 :: a1) (x2 :: a2) (x3 :: a3)
+  in
+  h lst [] [] []
 
 type rawterm_or_tactics = 
   RawTerm of rawterm 
@@ -803,5 +806,3 @@ let close_defined_module (modname : name) =
   let open CoqVernacUtils in 
   runVernac @@ 
   vernac_ (Vernacexpr.VernacEndSegment (CAst.make modname)) 
-
-

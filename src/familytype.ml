@@ -73,6 +73,7 @@ type family_type_or_coq_type =
     { 
       indsigs_from_org_ctx : coq_ind_sigs typed;
       (* original definition *)
+      name_groups: (name * name list) list;
       allnames : name list;
       (* all the identifier *)
 
@@ -81,13 +82,14 @@ type family_type_or_coq_type =
       compiled_inddefty : coqtype;
       (* the compiled concrete definition *)
       compiled_inddef : coqtype;
-      registered_prec : name option ref;
+      registered_prec : (name, name) smap ref;
       }
     
   (* Eliminator and Recursor *)
   | RecTy of {
               recursordef : fieldpath; 
-              inductivedef : fieldpath;
+              fnames : name list;
+              inductivedefs : fieldpath list;
               (* definitions, a reference pointing to the correct path *)
               postfix : string;
               (* definition : what is the using eliminator *)
@@ -99,15 +101,14 @@ type family_type_or_coq_type =
                   i.e. staged RecTy info 
                   Following info is used during inheritance *)
 
-
-              rawrecdef : (family_ctxtype -> rawterm) typed;
+              rawrecdef : (family_ctxtype -> rawterm list) typed;
 
               }
 
   (* computational axiom for recursor 
       it is 2D because it is about 2nd demensional stuff *)
-  | Rec2DTy of { recursordef  : fieldpath typed;      
-                 inductivedef : fieldpath ; 
+  | Rec2DTy of { recursordefs  : fieldpath list typed;      
+                 inductivedefs : fieldpath list ; 
                  (* definition : the recursor and inductive definitions *)
                  compiledtype : coqtype typed; 
                  compiledterm : coqterm }
@@ -125,17 +126,15 @@ type family_type_or_coq_type =
 
   | FTheoremTy of 
       { 
+        fnames: name list;
         (* definitions : *)
-        indref : fieldpath typed; 
+        indrefs : fieldpath list typed; 
         (* relative path to the inductive type *)
         postfix : string;
         (* the compiled motive *)
         motive : coqtype;
-
-
-
         (* the implemented handlers *)
-        all_handlers : name list ;
+        all_handlers : name list list;
         (* The final type *)
         recty : coqtype typed;  
       }
@@ -180,7 +179,8 @@ let rec pr_family_type_or_coq_type (t :family_type_or_coq_type) : Pp.t =
   | RecTy {recursordef; _} -> (str "Recursor :") ++ Libnames.pr_qualid recursordef
   (* | FakeRecTy {recursordef; _} -> (str "Not Completed Recursor :") ++ Libnames.pr_qualid recursordef *)
 
-  | Rec2DTy {recursordef; _} -> (str "Computational Axiom for Recursor :") ++ Libnames.pr_qualid (fst recursordef)
+  | Rec2DTy {recursordefs; _} ->
+    (str "Computational Axiom for Recursors :") ++ (List.fold_left (fun h t -> h ++ (str " , ") ++ Libnames.pr_qualid t) (str "") (fst recursordefs))
   | PRecTy {inductivedef; _} -> (str "Partial Recursor for Inductive Type :") ++ Libnames.pr_qualid (fst inductivedef)
   | ClosingFactTy {ty = (ModType t); _} ->  str "Axiom " ++ Libnames.pr_qualid t
   | FTheoremTy {recty = (ModType t , _); _} -> str "FTheorem " ++   Libnames.pr_qualid t
@@ -292,18 +292,22 @@ type family_ref =
 and family_term_or_coq_term = 
   FamTm of family_term 
   | CompiledDef of coqterm
-  | RecDef of (rawterm typed) * coqterm typed
+  | RecDef of {
+    typedrawterm: rawterm list typed;
+    motive: coqterm typed;
+    fnames: name list;
+  }
   | ClosingFactProof of coqtype * coqterm * rawterm_or_tactics 
-  | FTheoremTm of 
-      {
-       motive_in_coqtm : coqterm typed;
-       (* inductivedef : fieldpath;  *)
-       (* relative path to the inductive type *)
-       handlers_in_mod : coqterm typed; (* Include all the handlers here *)
-       indref : fieldpath typed; (* Store the path reference to the inductive type *)
-       raw_recursor_constr : fieldpath option -> name -> name list -> rawterm;
-       all_handlers : name list;
-      }
+  | FTheoremTm of {
+    fnames: name list; 
+    motive_in_coqtm : coqterm typed;
+    (* inductivedef : fieldpath;  *)
+    (* relative path to the inductive type *)
+    handlers_in_mod : coqterm typed; (* Include all the handlers here *)
+    indrefs : fieldpath list typed; (* Store the path reference to the inductive type *)
+    raw_recursor_constr : fieldpath option -> name -> name list -> rawterm list;
+    all_handlers : name list list;
+  }
 
   (* any other term is belong to this one
       because those terms doesn't require special treatment *)
@@ -363,8 +367,8 @@ and inh_op =    CInhInherit
                   kind : [`New | `Extend ] ;
                   motive : coqterm typed; 
                   compiled_handlers : coqterm typed;
-                  rec_cstr : (fieldpath option -> name -> name list -> rawterm); 
-                  all_handlers : name list
+                  rec_cstr : (fieldpath option -> name -> name list -> rawterm list); 
+                  all_handlers : name list list
               }
                   (* the first coqterm typed is the information for motive
                       the second coqterm typed is the information for all the handeler in one module
@@ -603,42 +607,40 @@ let rename_ind_cstrs_ctx
   let t_s = List.map (fun x -> rename_ind_cstr_ctx (x, ctx) nctx) t in 
   (List.map fst t_s, nctx)
 (* Note : it only change the first level *)
-let wkinh_indsigs ((parent_ind_trace, FamCtx oldctx) : coq_ind_sigs typed) (FamCtx newctx : family_ctxtype) : coq_ind_sigs typed
- =  
- let parent_ind =   List.hd parent_ind_trace in
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> List.length parent_ind = 1);
-    (* No mutual inductive type *)
-    let parent_ind = List.hd parent_ind in 
+let wkinh_indsigs ((parent_ind_trace, FamCtx oldctx) : coq_ind_sigs typed) (FamCtx newctx : family_ctxtype) : coq_ind_sigs typed =
+  let parent_inds = List.hd parent_ind_trace in
+  let child_ind_defs = parent_inds |> List.map (fun parent_ind ->
     (* don't allow notation *)
     assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd parent_ind = []);
     (* sanity check on newcstrs *)
-    let ((wtc, (old_name, univinfo)), oldparams, oldty, oldcstrs) = fst parent_ind in 
+    let ((wtc, (old_name, univinfo)), oldparams, oldty, oldcstrs) = fst parent_ind in
     assert_cerror_forced ~einfo:__LOC__ (fun _ -> oldparams = ([],None));
-    let newcstrs = 
-      match oldcstrs with 
-      | Vernacexpr.Constructors a -> 
+    let newcstrs =
+      match oldcstrs with
+      | Vernacexpr.Constructors a ->
         let a, _ = rename_ind_cstrs_ctx (a, FamCtx oldctx) (FamCtx newctx) in
         Vernacexpr.Constructors a
-      | _-> cerror ~einfo:("Expect Inductive Constructor!"^__LOC__) () 
-    in 
-    let ctx_mapping = 
-      let ctx_mapping = 
+      | _-> cerror ~einfo:("Expect Inductive Constructor!"^__LOC__) ()
+    in
+    let ctx_mapping =
+      let ctx_mapping =
         smap_construct (List.map fst oldctx) (List.map fst newctx) in
       let ctx_mapping =
-        List.fold_left 
+        List.fold_left
           (fun d (k,v) ->
               Dict_Name.add (self_version_name k) (self_version_name v) d
-            ) Dict_Name.empty ctx_mapping in  ctx_mapping in
+            ) Dict_Name.empty ctx_mapping in ctx_mapping in
     let newty = Option.map (replace_qualid_root ctx_mapping) oldty
     in
     (* type of child_ind = type of (fst parent_ind) *)
-    let child_ind = ((wtc, (old_name, univinfo)), oldparams, newty, newcstrs) in 
-    let child_ind_def = ([(child_ind, [])]) in 
-    (child_ind_def::List.tl parent_ind_trace, (FamCtx newctx))
-    
+    let child_ind = ((wtc, (old_name, univinfo)), oldparams, newty, newcstrs) in
+    (child_ind, [])
+  ) in
+  (child_ind_defs::List.tl parent_ind_trace, (FamCtx newctx))
+
 let wkinh_indsig (a,ctx : coq_ind_sig typed) (b : family_ctxtype) : coq_ind_sig typed = 
   match (wkinh_indsigs ([a], ctx) b) with 
-  | t::[], ctx -> (t, ctx)
+  | [t], ctx -> (t, ctx)
   | _ -> cerror ~einfo:__LOC__ ()
 
 let wkinh_rawterm ((t, FamCtx oldctx) : rawterm typed) (FamCtx newctx : family_ctxtype) : rawterm typed = 
@@ -750,12 +752,12 @@ let inh_internal
 (* Extend the output with a new term
     this term will need to be typed in the output
 *)
-let inhnew_or_extend_fthm (i : inh) (fname : name) 
+let inhnew_or_extend_fthm (i : inh) (fnames : name list) 
   (parent_type : family_type_or_coq_type typed option)
   rec_constr
   (handlers_in_one_mod : coqterm typed) 
   (motive : coqtype)
-  indref ?(postfix="_ind_comp") recty all_handlers 
+  indrefs ?(postfix="_ind_comp") recty all_handlers 
   (motive_in_coqtm : coqterm typed)
   : inh = 
   (* let (_, tctx) = handlers_in_one_mod          in  *)
@@ -764,24 +766,25 @@ let inhnew_or_extend_fthm (i : inh) (fname : name)
   (* TODO: check t is really of type tT *)
   let ((inp, oup), ctx), inhs = i in 
   (* TODO: Sanity Check about linkage shape *)
-  let newinhs = 
-      let has_parent = 
-        match parent_type with 
-        | None -> `New 
-        | Some _ -> `Extend in 
-      let cinh_info = 
-        CInhFThm {kind = has_parent; 
-                  motive = motive_in_coqtm; 
-                  compiled_handlers = handlers_in_one_mod;
-                  rec_cstr = rec_constr;  all_handlers;} in 
-      (fname , cinh_info) :: inhs in
-  let newinp= 
-        match parent_type with 
-        | None -> inp
-        | Some (p, _) ->  fst @@  famty_ext_ (inp, ctx) fname p in  
-  let (newoup, ctxb) = famty_ext_  (oup, ctx) fname (FTheoremTy {motive; indref; all_handlers; postfix; recty}) in 
+  let fname = List.hd fnames in
+  let newinhs =
+    let has_parent =
+      match parent_type with 
+      | None -> `New 
+      | Some _ -> `Extend in 
+    let cinh_info = 
+      CInhFThm {kind = has_parent; 
+                motive = motive_in_coqtm; 
+                compiled_handlers = handlers_in_one_mod;
+                rec_cstr = rec_constr; all_handlers} in 
+    (fname, cinh_info) :: inhs in
+  let newinp =
+    match parent_type with 
+    | None -> inp
+    | Some (p, _) ->  fst @@ famty_ext_ (inp, ctx) fname p in  
+  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (FTheoremTy {fnames; motive; indrefs; all_handlers; postfix; recty}) in 
 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb); 
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb);  *)
   ((newinp, newoup), ctx), newinhs
   
 
@@ -860,7 +863,7 @@ let inhnew  (i : inh) (fname : name)
   (* TODO: Sanity Check about linkage shape *)
   let newinhs = (fname , newinhop) :: inhs in 
   let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (fst newoupty) in 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb); 
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb);  *)
   ((inp, newoup), ctx), newinhs
 
 
@@ -1138,7 +1141,7 @@ let famty_to_modsig_open_rec
               let* _ = include_mod applied_current_field in  
                 return ()
             ) in res     *)
-      | RecTy {recty = ((ModType tymodref), _); motive = (ModTerm motive), _; rawrecdef; _} -> 
+      | RecTy {recty = ((ModType tymodref), _); motive = (ModTerm motive), _; fnames; rawrecdef; postfix; inductivedefs; _} -> 
         let exposed_def = 
           let current_path = _qualid_point_ (Some current_path) fname in 
           match Set_Fieldpath.find_opt current_path ov_exposed with 
@@ -1154,11 +1157,12 @@ let famty_to_modsig_open_rec
           (fun ctx ->
             (let applied_motive = 
               apply_mods (pure motive) ctx in 
-            let* _ = include_mod applied_motive in 
-            let* _ = define_term fname (rawterm rawsctx) in  
-              return ())
-            )
-        in 
+            let* _ = include_mod applied_motive in
+            let rawterms = rawterm rawsctx in
+            let* _ = flatmap @@ 
+              List.map (fun (n, t) -> define_term n t)
+              (List.combine fnames rawterms) in
+            return ())) in 
         let typed_recdef = 
           (* evaluate typed_recdef based on exposed_def *)
           if exposed_def then 
@@ -1212,7 +1216,7 @@ famctx_to_parameters
 
 let (famty_to_modsig, famctx_to_parameters) = 
   let open CCCache in 
-  let ty2mod2sig, ctx2param = CCCache.with_cache_rec2 (lru ~eq:(fun a b -> (Stdlib.compare a b) = 0)  (_CACHE_SIZE_*2)) famty_to_modsig_open_rec famctx_to_parameters_open_rec in 
+  let ty2mod2sig, ctx2param = CCCache.with_cache_rec2 (lru (_CACHE_SIZE_*2)) famty_to_modsig_open_rec famctx_to_parameters_open_rec in 
   let famty_to_modsig 
     ?(ov_exposed = (Set_Fieldpath.empty : Set_Fieldpath.t)) 
     ?(current_path = (empty_path : fieldpath)) 
@@ -1330,9 +1334,9 @@ let famterm_to_mod_open_rec famterm_to_mod  (famtyped : family_term typed)  : mo
           let applied_current_field = apply_mods (pure tmmodref) ctx in 
           let* _ = include_mod applied_current_field in  
           return ()
-      | RecDef (typedrawterm, ((ModTerm motive), _)) ->
+      | RecDef {typedrawterm; motive = (ModTerm motive, _); fnames} ->
         let typed_recdef = 
-          let rawterm, rawsctx = typedrawterm in 
+          let rawterms, rawsctx = typedrawterm in 
           let itsparameter = famctx_to_parameters_selfprefix ~all_exposed:true rawsctx in
           runVernac @@ 
           define_module (freshen_name ~prefix:fname ()) itsparameter 
@@ -1340,17 +1344,17 @@ let famterm_to_mod_open_rec famterm_to_mod  (famtyped : family_term typed)  : mo
             (let applied_motive = 
               apply_mods (pure motive) ctx in 
             let* _ = include_mod applied_motive in 
-            let* _ = define_term fname rawterm in  
-              return ())
-            )
-        in
+            let* _ = flatmap @@ 
+              List.map (fun (n, t) -> define_term n t)
+              (List.combine fnames rawterms) in
+            return ())) in
         fun ctx ->
           let* _ = famterm_internal_include (t, fctx) ctx in 
           let applied_rec = apply_mods (pure typed_recdef) ctx in 
           let* _ = include_mod applied_rec in 
           (* let* _ = define_term fname rawterm in   *)
             return ()
-      | FTheoremTm {motive_in_coqtm; handlers_in_mod; raw_recursor_constr; all_handlers; indref } ->
+      | FTheoremTm {fnames; motive_in_coqtm; handlers_in_mod; raw_recursor_constr; all_handlers; indrefs } ->
         let ModTerm handlers_in_mod, thectx = handlers_in_mod in 
         let ModTerm motive_in_coqtm, _ = motive_in_coqtm in 
         let (_, modname) = to_qualid_name handlers_in_mod in
@@ -1362,8 +1366,8 @@ let famterm_to_mod_open_rec famterm_to_mod  (famtyped : family_term typed)  : mo
         let newmodname2 = freshen_name ~prefix:fname () in
         (* compiled untyped recursor *)
         let typechecked_rec = 
-          let indrec_prepath, _ = to_qualid_name (fst indref) in 
-          let rawrec = raw_recursor_constr indrec_prepath modname all_handlers in 
+          let indrec_prepath, _ = to_qualid_name (List.hd (fst indrefs)) in 
+          let rawrecs = raw_recursor_constr indrec_prepath modname (List.flatten all_handlers) in 
           (* weaken the rawrec *)
           let itsparameter = famctx_to_parameters_selfprefix ~all_exposed:true hctx in 
           runVernac @@
@@ -1373,7 +1377,8 @@ let famterm_to_mod_open_rec famterm_to_mod  (famtyped : family_term typed)  : mo
             let* _ = include_mod applied_motive_mod in 
             let applied_handlers = apply_mods (pure wrapped_handlers) ctx in 
             let* _ = include_mod applied_handlers in 
-            let* _ = define_term fname rawrec in return ()
+            let* _ = flatmap @@ List.map (fun (n, t) -> define_term n t) (List.combine fnames rawrecs) in
+            return ()
             )
         in 
         fun ctx ->
@@ -1399,7 +1404,7 @@ let famterm_to_mod_constr ((fam, fctx) : family_term typed) : modtermref =
       newv
 let famterm_to_mod = 
   let open CCCache in 
-  with_cache_rec (lru ~eq:(fun a b -> (Stdlib.compare a b) = 0)  _CACHE_SIZE_) famterm_to_mod_open_rec 
+  with_cache_rec (lru _CACHE_SIZE_) famterm_to_mod_open_rec 
 
 
 
@@ -1573,7 +1578,7 @@ let from_recursor_type_to_subcase_handlers_constructor (cstname : name list) (re
   let isArrow {CAst.v = t; _} = match t with | CNotation (_, (_, "_ -> _"), _) -> true | _ -> false in
   let destDepProd {CAst.v = t; _} = 
     match t with 
-    | CProdN (al, b) -> assert_cerror (fun _ ->List.length al = 1); (al, b)
+    | CProdN (al, b) -> (al, b)
     | _ -> cerror () in 
   let destArrow {CAst.v = t; _} = 
     match t with 
@@ -1610,7 +1615,7 @@ let collect_argument_and_ret_of_lambda (f : rawterm) : (((local_binder_expr_assu
   (* let isArrow {CAst.v = t; _} = match t with | CNotation (_, (_, "_ -> _"), _) -> true | _ -> false in *)
   let destLambda {CAst.v = t; _} = 
     match t with 
-    | CLambdaN (al, b) -> assert_cerror (fun _ ->List.length al = 1); (al, b)
+    | CLambdaN (al, b) -> (al, b)
     | _ -> cerror () in 
   let give_name ({CAst.v = n; _} : Names.lname) : name =
     match n with 
@@ -1650,7 +1655,7 @@ let collect_argument_and_ret_of_lambda (f : rawterm) : (((local_binder_expr_assu
     let isArrow {CAst.v = t; _} = match t with | CNotation (_, (_, "_ -> _"), _) -> true | _ -> false in
     let destDepProd {CAst.v = t; _} = 
       match t with 
-      | CProdN (al, b) -> assert_cerror (fun _ ->List.length al = 1); (al, b)
+      | CProdN (al, b) -> (al, b)
       | _ -> cerror () in 
     let destArrow {CAst.v = t; _} = 
       match t with 
@@ -1743,7 +1748,7 @@ let replace_var_with_rawterm_in_constr ctx_mapping =
   let open Libnames in 
   let rec replace dict r =
     match r with
-    | { CAst.loc; CAst.v = CRef (qid,us) } as x when (qualid_is_ident qid)  ->
+    | { CAst.loc; CAst.v = CRef (qid,us) } as x ->
         (* rename the  *)
       let _, key = repr_qualid qid in 
       (match Dict_Name.find_opt key dict with 
@@ -1841,7 +1846,7 @@ let generate_injection_propsig
       assume_parameter defname cstr_ty
   in 
   thunk @@ fun () -> flatmap (List.map for_each all_cstr_name)
-
+  
 let is_sort (t : rawterm) : bool =
   match t.v with 
   | Constrexpr.CSort _ -> true 
@@ -1893,7 +1898,7 @@ let inductive_to_famtype =
   (* TODO : add the precursor inside *)
   in
   let open CCCache in 
-  with_cache (lru ~eq:(fun a b -> (Stdlib.compare a b) = 0)  _CACHE_SIZE_) inductive_to_famtype 
+  with_cache (lru _CACHE_SIZE_) inductive_to_famtype 
 
 
 
@@ -1944,39 +1949,8 @@ let generate_injection_prooftms
 
 let inductive_to_famterm_and_recursor_type =
 let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) : 
-    modtermref * ((string, (coqterm typed * ( (name, coqterm typed) smap ))) smap)  = 
+    modtermref * (((name list * string), (coqterm typed * ( (name, coqterm typed) smap ))) smap)  = 
   (* we only use the complete inherited indsig in this function *)
-  (* 1. Collect all the name and add a "internal" in front of it *)
-  let generated_recursor_type : (string, rawterm) smap ref = ref [] in
-  let collect_recursor_in_current_coqenvironment (inddefname : name) () : unit CoqVernacUtils.vernacWriter = 
-    let possible_suffix = ["_ind"; "_ind_comp"; "_rec"; "_rect"] in 
-
-    let for_each_suffix suf = 
-      let recursor_name = Nameops.add_suffix (internal_version_name inddefname) suf in 
-      
-      match Constrintern.is_global recursor_name with 
-      | false -> ()
-      | true ->
-        let recursor_name = Libnames.qualid_of_ident recursor_name in 
-        let the_recursor = Constrexpr_ops.mkRefC recursor_name in 
-        let the_typ =  type_check the_recursor in 
-        let the_typ = reflect_safeterm the_typ in 
-        (* rename the internal_... back to normal name *)
-        let all_names = extract_all_ident (fst typed_indsigs) in 
-        let all_newnames = List.map internal_version_name all_names in 
-        (* 2. Construct map and corresponding substitution for it *)
-        let assoc_newname_oldname = smap_construct all_newnames all_names in
-        let map_newname_oldname = List.fold_right (fun (k,v) map -> Names.Id.Map.add k v map) assoc_newname_oldname Names.Id.Map.empty in 
-        let the_typ = Constrexpr_ops.replace_vars_constr_expr map_newname_oldname the_typ in 
-        generated_recursor_type := (suf, the_typ)::(!generated_recursor_type)
-      (* then we check if this recursor name is in the environment *)
-    in 
-    let _ = List.map for_each_suffix possible_suffix in 
-    CoqVernacUtils.return () in
-  let indcstrs = List.map (fun (x,_) -> extract_type_and_cstrs x) @@ List.hd @@ fst typed_indsigs in 
-    (* 1. Collect all the name and add a "internal" in front of it *) 
-  let all_cstrnames = List.concat_map (fun (_, y) -> List.map fst y) indcstrs in
-
   let constr_inductive_to_famterm_toplevel ((indsig, ctx) : coq_ind_sig typed)  = 
     let indcstrs = List.map (fun (x,_) -> extract_type_and_cstrs x) indsig in 
     let if_generate_injprop : bool = 
@@ -1988,24 +1962,45 @@ let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) 
           | _ -> false 
       ) type_decl_sort in 
     (* 1. Collect all the name and add a "internal" in front of it *)
-    let all_original_type_names = List.map (fun ((x,_),_) -> x) indcstrs in 
-    let typename = List.hd all_original_type_names in 
-    let all_names = List.map (fun ((x,_),y) -> x :: (List.map fst y)) indcstrs in 
-    let all_names = List.concat all_names in 
-    let indsigname = List.hd all_names in  
+    let name_groups = List.map (fun ((x,_),y) -> x, List.map fst y) indcstrs in 
+    let typenames = List.map fst name_groups in
+    let all_cstrnames = List.concat_map snd name_groups in
+    let all_names = typenames @ all_cstrnames in
+    let indsigname = List.hd typenames in  
     let all_newnames = List.map internal_version_name all_names in 
     (* 2. Construct map and corresponding substitution for it *)
     let associated_name_newname = smap_construct all_names all_newnames in 
-    let map_name_newname = List.fold_right (fun (k,v) map -> Names.Id.Map.add k v map) associated_name_newname Names.Id.Map.empty in 
-    let subst = Constrexpr_ops.replace_vars_constr_expr map_name_newname in 
+    let map_oldname_newname = List.fold_right (fun (k,v) map -> Names.Id.Map.add k v map) associated_name_newname Names.Id.Map.empty in 
+    let map_newname_oldname = List.fold_right (fun (k,v) map -> Names.Id.Map.add v k map) associated_name_newname Names.Id.Map.empty in
+    let subst_old_to_new = Constrexpr_ops.replace_vars_constr_expr map_oldname_newname in
+    let subst_new_to_old = Constrexpr_ops.replace_vars_constr_expr map_newname_oldname in 
+    
+    let generated_recursor_type : ((name list * string), rawterm) smap ref = ref [] in
+    let possible_suffix = ["_ind"; "_ind_comp"; "_rec"; "_rect"] in 
+    
+    let collect_recursor_in_current_coqenvironment (inddefname : name) () : unit CoqVernacUtils.vernacWriter = 
+      let for_each_suffix suf = 
+        let recursor_name = Nameops.add_suffix (internal_version_name inddefname) suf in 
+        match Constrintern.is_global recursor_name with 
+        | false -> ()
+        | true ->
+          let recursor_name = Libnames.qualid_of_ident recursor_name in 
+          let the_recursor = Constrexpr_ops.mkRefC recursor_name in 
+          let the_typ = subst_new_to_old (reflect_safeterm (type_check the_recursor)) in 
+          generated_recursor_type := (([inddefname], suf), the_typ)::(!generated_recursor_type)
+        (* then we check if this recursor name is in the environment *)
+      in
+      List.iter for_each_suffix possible_suffix;
+      CoqVernacUtils.return () in
+    
     (* 3. Apply subst to corresponding places, and renaming all the constructors and types *)
     let open Vernacexpr in 
     let each_apply_subst ((((a1, (a21,a22)), b, c,d), y) : inductive_expr * decl_notation list) : inductive_expr * decl_notation list =
       let a21 = CAst.map internal_version_name a21 in 
-      let c = Option.map subst c in 
+      let c = Option.map subst_old_to_new c in 
       match d with 
       | Constructors csts ->
-        let csts = List.map (fun (z,(x, y)) -> (z, (CAst.map internal_version_name x, subst y))) csts in 
+        let csts = List.map (fun (z,(x, y)) -> (z, (CAst.map internal_version_name x, subst_old_to_new y))) csts in 
         let d = Constructors csts in 
         (((a1, (a21,a22)), b, c,d), y)
       | _ -> cerror ~einfo:"Expect Constructors" () 
@@ -2014,7 +2009,8 @@ let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) 
     let modified_indcstrs =  List.map each_apply_subst indsig in 
     (* 4. construct export mapping, for example, 
             tm : Set := __internal_tm *)
-    let allname_typedecl = List.concat_map (fun ((x,y),z) -> (x, Option.get y) :: z) indcstrs in 
+    let allname_typedecl = List.map (fun ((x,y),z) -> (x, Option.get y) :: z) indcstrs in 
+    let allname_typedecl = List.map List.hd allname_typedecl @ List.concat_map List.tl allname_typedecl in
     let alias_all_name_term_type_decl = 
         List.map 
           (fun (n, ty) -> 
@@ -2023,20 +2019,68 @@ let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) 
           (* Now construct the module for it *)
     let modname = freshen_name ~prefix:indsigname () in
     let open CoqVernacUtils in 
+    let generate_mutual () : unit CoqVernacUtils.vernacWriter =
+      let mutual_recursors = ref [] in
+      typenames |> iter_combs (fun tns -> 
+        match tns with
+        | [] | [_] -> ()
+        | _ -> possible_suffix |> List.iter (fun suffix ->
+          if List.for_all (fun tn -> List.mem_assoc ([tn], suffix) !generated_recursor_type) tns then
+            let sort = match suffix with 
+              | "_ind" | "_ind_comp" -> Sorts.InProp
+              | "_rec" -> Sorts.InSet
+              | "_rect" -> Sorts.InType
+              | _ -> cerror ~einfo:"Unsupported suffix" () in
+            let joined_indnames = concat_names tns in
+            let indp_name = Nameops.add_suffix joined_indnames suffix in
+            let internal_indp_name = internal_version_name indp_name in
+            let names = tns |> List.map (fun tn ->
+              let defined_typename = internal_version_name tn in
+              let decorated_typename = CAst.make @@ Constrexpr.AN (Libnames.qualid_of_ident defined_typename) in
+              let defining_ind_name = CAst.make @@ Nameops.add_prefix ((Names.Id.to_string defined_typename) ^ "_") indp_name in
+              (defining_ind_name, decorated_typename)) in
+            mutual_recursors := (thunk (fun () ->
+              let* _ = vernac_ (
+                VernacScheme (
+                  List.map (fun (defining_ind_name, decorated_typename) ->
+                    (Some defining_ind_name, InductionScheme(true, decorated_typename, sort))
+                  ) names
+                )
+              ) in
+              let* _ = ([TrySilent (VernacCombinedScheme (CAst.make internal_indp_name, List.map fst names))], ()) in
+              let* _ = thunk (fun () ->
+                let the_recursor = Constrexpr_ops.mkRefC (Libnames.qualid_of_ident internal_indp_name) in
+                try
+                  let the_typ = subst_new_to_old (reflect_safeterm (type_check the_recursor)) in 
+                  generated_recursor_type :=  ((tns, suffix), the_typ)::!generated_recursor_type;
+                  return ()
+                with _ -> return ()
+              ) in
+              return ()
+            ))::!mutual_recursors
+        )
+      );
+      flatmap !mutual_recursors in
     let construct_module_for_ind =
       define_module modname (famctx_to_parameters_selfprefix ctx) 
       (fun _ ->
         (* First Define the Inductive Type itself *)
         let* _ = vernac_ (VernacInductive (Inductive_kw , modified_indcstrs)) in 
         (* Then we fix Propositional Induction principle *)
-        let defined_typename = internal_version_name typename in 
-        let decorated_typename = CAst.make @@ Constrexpr.AN (Libnames.qualid_of_ident defined_typename) in 
-        let defining_ind_name = CAst.make @@ Nameops.add_suffix defined_typename "_ind_comp" in 
-        let* _ = vernac_ (VernacScheme [(Some defining_ind_name, InductionScheme(true, decorated_typename, Sorts.InProp) )]) in 
+        let* _ = vernacs_ @@ List.map (fun typename ->
+            let defined_typename = internal_version_name typename in
+            let decorated_typename = CAst.make @@ Constrexpr.AN (Libnames.qualid_of_ident defined_typename) in
+            let defining_ind_name = CAst.make @@ Nameops.add_suffix defined_typename "_ind_comp" in
+            VernacScheme [(Some defining_ind_name, InductionScheme(true, decorated_typename, Sorts.InProp) )]
+          ) typenames in 
         (* Adhocly extract the recursor type for each recursor
             TODO: support other type as well, currently only support _ind   
         *)
-        let* _ = thunk (collect_recursor_in_current_coqenvironment typename) in 
+        let* _ = flatmap @@
+          List.map (fun typename ->
+            thunk (collect_recursor_in_current_coqenvironment typename)
+          ) typenames in
+        let* _ = thunk generate_mutual in
         (* Then export the inductive type, consistent with the interface type *)
         let alias_all = List.map (fun (n,tm, eT) -> define_term n ~eT:(Some eT) tm) alias_all_name_term_type_decl in 
         let* _ =  flatmap alias_all  in
@@ -2054,27 +2098,30 @@ let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) 
           (match indctx with 
           | (selfname, oup)::ctx_of_parent_ind -> ctx_of_parent_ind, selfname, oup 
           | _  -> cerror ~einfo:__LOC__ ()) in 
-        let newoup, _ =  
-          famty_ext_  
-            (topoup, FamCtx ctx_of_topoup) typename 
-            (CoqIndTy ({allnames = all_names; indsigs_from_org_ctx = typed_indsigs ; 
-                        compiled_inddefty = ModType compiled_inddefty; 
-                        compiled_inddef = ModType compiled_inddef;
-                        registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"registered_prec" ()) None
-                        })) in 
-        FamCtx ((selfname, (newoup))::ctx_of_topoup) in
-    let compile_each_recursor_and_recursor_handler (suffix : string) (recursor : rawterm) = 
+        let newoup, _ = 
+          famty_ext_
+          (topoup, FamCtx ctx_of_topoup) indsigname
+          (CoqIndTy ({name_groups; allnames = all_names; indsigs_from_org_ctx = typed_indsigs ; 
+                      compiled_inddefty = ModType compiled_inddefty; 
+                      compiled_inddef = ModType compiled_inddef;
+                      registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"registered_prec" ()) []
+                      })) in
+        FamCtx ((selfname, newoup)::ctx_of_topoup) in
+    let compile_each_recursor_and_recursor_handler (typenames : name list) (suffix : string) (recursor : rawterm) = 
         let recursor_context = __recursor_context in 
+        let typename = concat_names typenames in
         let recursor_name = (Nameops.add_suffix typename suffix) in 
         let parameters = famctx_to_parameters_selfprefix recursor_context in 
         let last_param, _ = List.hd @@ List.rev parameters in
         let attach_self (f : name) = 
           Constrexpr_ops.mkRefC @@ Libnames.make_qualid (Names.DirPath.make [last_param]) f in 
-        let all_newname = List.map attach_self all_names in 
-        let assoc_name_newname = smap_construct all_names all_newname in 
+        let cstrnames = List.concat_map (fun n -> smap_assoc n name_groups) typenames in
+        let names = (List.map fst name_groups) @ cstrnames in
+        let newnames = List.map attach_self names in 
+        let assoc_name_newname = smap_construct names newnames in 
         let map_name_newname = List.fold_right (fun (k,v) map -> Dict_Name.add k v map) assoc_name_newname Dict_Name.empty in 
         let recursor = replace_var_with_rawterm_in_constr map_name_newname recursor in 
-        let rec_handler = from_recursor_type_to_subcase_handlers_constructor all_cstrnames recursor in 
+        let rec_handler = from_recursor_type_to_subcase_handlers_constructor cstrnames recursor in 
         (* we need to attach self_last_param everywhere *)
         let open CoqVernacUtils in 
         let typed_compiled_handlers = 
@@ -2099,21 +2146,21 @@ let inductive_to_famterm_and_recursor_type (typed_indsigs : coq_ind_sigs typed) 
         (typed_compiled_recursor, typed_compiled_handlers) in 
     let all_compiled_recursor_related = 
         List.map 
-          (fun (suffix, recursor) ->  
-              suffix, 
+          (fun ((typenames, suffix), recursor) ->  
+              (typenames, suffix), 
               compile_each_recursor_and_recursor_handler 
-                suffix 
+                typenames
+                suffix
                 recursor)
-          !generated_recursor_type in 
+          !generated_recursor_type in
+    
     (compiled_inddef, all_compiled_recursor_related)
           
   in 
   let top_typed_ind_sig = (List.hd (fst typed_indsigs), snd typed_indsigs) in 
   constr_inductive_to_famterm_toplevel top_typed_ind_sig in 
   let open CCCache in 
-  with_cache (lru ~eq:(fun a b -> (Stdlib.compare a b) = 0)  _CACHE_SIZE_) inductive_to_famterm_and_recursor_type 
-
-
+  with_cache (lru _CACHE_SIZE_) inductive_to_famterm_and_recursor_type
 
 let dictionary_of_inh (i : inh) = 
     (* let inh_dict = Dict_Name.add_seq (List.to_seq (snd i)) Dict_Name.empty in  *)
@@ -2154,11 +2201,15 @@ let rec inh_apply_ (i : inh) (t : family_term) : family_term typed =
   let dict_of_iou = dictionary_of_inh i in 
   let inhop_apply (i : inh_op) (exp_field_type, exp_field_type_ctx : family_type_or_coq_type typed) ((tm, tmctx) : family_term_or_coq_term typed) : family_term_or_coq_term typed =
       match i, tm, exp_field_type with 
-      | CInhInherit, (FTheoremTm ({indref = _; _} as ftminfo)), FTheoremTy {indref = newindref; _} -> ((FTheoremTm {ftminfo with indref = newindref}), exp_field_type_ctx) 
+      | CInhInherit, (FTheoremTm ({indrefs = _; _} as ftminfo)), FTheoremTy {indrefs = newindrefs; _} ->
+        ((FTheoremTm {ftminfo with indrefs = newindrefs}), exp_field_type_ctx) 
       (* TODO : remove it and refactor famterm_to_mod into type-guided*)
-      | CInhInherit, _, Rec2DTy {compiledterm; _} -> (CompiledDef compiledterm, exp_field_type_ctx) 
-      | CInhInherit, _, PRecTy {prectm = ModType prectm; _} -> (CompiledDef (ModTerm prectm), exp_field_type_ctx) 
-      | CInhInherit , _, RecTy { rawrecdef = (rtm, tmctx); motive ; _ } -> ( RecDef ((rtm tmctx, tmctx), motive) , exp_field_type_ctx)
+      | CInhInherit, _, Rec2DTy {compiledterm; _} ->
+        (CompiledDef compiledterm, exp_field_type_ctx) 
+      | CInhInherit, _, PRecTy {prectm = ModType prectm; _} ->
+        (CompiledDef (ModTerm prectm), exp_field_type_ctx) 
+      | CInhInherit , _, RecTy { rawrecdef = (rtm, tmctx); motive; fnames; _ } ->
+        (RecDef { typedrawterm = (rtm tmctx, tmctx); motive; fnames }, exp_field_type_ctx)
       | CInhInherit, _, _ -> (tm, exp_field_type_ctx) 
       (* We don't do error checking here *)
       (* | CInhInheritFam , (FamTm _) -> (tm, tmctx) *)
@@ -2170,7 +2221,8 @@ let rec inh_apply_ (i : inh) (t : family_term) : family_term typed =
           let ftm, _ = inh_apply inner (ftm, tmctx) in 
           (FamTm (ftm), exp_field_type_ctx)
       | CInhExtendInh _, _, _ -> cerror ~einfo:"Cannot Extend a Non-Family Field" ()
-      | CInhFThm {kind = `Extend; motive = motive_in_coqtm; compiled_handlers =  handlers_in_mod_new; rec_cstr = raw_recursor_constr; all_handlers} , FTheoremTm {handlers_in_mod = handlers_in_mod_old; _}, FTheoremTy {indref ; _} ->
+      | CInhFThm {kind = `Extend; motive = motive_in_coqtm; compiled_handlers = handlers_in_mod_new; rec_cstr = raw_recursor_constr; all_handlers},
+        FTheoremTm {fnames; handlers_in_mod = handlers_in_mod_old; _}, FTheoremTy {indrefs; _} ->
         let modname, ctx = 
           let ModTerm newmodname, ctx = handlers_in_mod_new in 
           let _, prefix = to_qualid_name newmodname in 
@@ -2187,7 +2239,7 @@ let rec inh_apply_ (i : inh) (t : family_term) : family_term typed =
               let* _ = include_mod (apply_mods (pure newmod) ctx) in 
               return ())) in
         let typed_combined_mod = ModTerm combined_mod, ctx in 
-        (FTheoremTm ({motive_in_coqtm; handlers_in_mod = typed_combined_mod; raw_recursor_constr; all_handlers; indref}), exp_field_type_ctx)
+        (FTheoremTm ({fnames; motive_in_coqtm; handlers_in_mod = typed_combined_mod; raw_recursor_constr; all_handlers; indrefs}), exp_field_type_ctx)
       | CInhExtendInd (_, _) , _, CoqIndTy {indsigs_from_org_ctx = new_combined_def; _} -> 
         let inddef', _ = inductive_to_famterm_and_recursor_type new_combined_def in 
         (CompiledDef (ModTerm inddef') , exp_field_type_ctx)
@@ -2204,7 +2256,8 @@ let rec inh_apply_ (i : inh) (t : family_term) : family_term typed =
 
   let inhop_standalone (i : inh_op) (exp_field_type, exp_field_type_ctx : family_type_or_coq_type typed) : family_term_or_coq_term typed =
     match i, exp_field_type with 
-    | CInhNew _, RecTy { rawrecdef = (rtm, tmctx); motive ; _ } -> (RecDef ((rtm exp_field_type_ctx, exp_field_type_ctx),motive) , exp_field_type_ctx)
+    | CInhNew _, RecTy { rawrecdef = (rtm, tmctx); motive; fnames; _ } ->
+      (RecDef { typedrawterm = (rtm tmctx, tmctx); motive; fnames }, exp_field_type_ctx)
     | CInhNew (t, ctx), Rec2DTy {compiledterm; _} -> (CompiledDef compiledterm, exp_field_type_ctx)
     | CInhNew (t, ctx), _ -> (CompiledDef t, exp_field_type_ctx)
     | CInhNewFam (class_list, inner), (FamTy _) ->
@@ -2219,7 +2272,8 @@ let rec inh_apply_ (i : inh) (t : family_term) : family_term typed =
     | CInhNewAxiom t, ClosingFactTy {ty = (tty); tytm = rawterm; _} -> (ClosingFactProof (tty, rawterm, t), exp_field_type_ctx)
     | CInhExtendInd _, _  -> cerror ~einfo:"Unexpected, Shouldn't be extend ind" ()
 
-    | CInhFThm {kind = `New; motive = motive_in_coqtm; compiled_handlers =  handlers_in_mod; rec_cstr = raw_recursor_constr; all_handlers}, FTheoremTy {indref; _} -> FTheoremTm {motive_in_coqtm; handlers_in_mod; raw_recursor_constr; all_handlers; indref}, (snd handlers_in_mod)
+    | CInhFThm {kind = `New; motive = motive_in_coqtm; compiled_handlers = handlers_in_mod; rec_cstr = raw_recursor_constr; all_handlers}, FTheoremTy {fnames; indrefs; _} ->
+      FTheoremTm {fnames; motive_in_coqtm; handlers_in_mod; raw_recursor_constr; all_handlers; indrefs}, (snd handlers_in_mod)
     | _ -> 
       let info = Pp.string_of_ppcmds @@ pr_inh_op i in 
       nonimplement ~moreinfo:(info ^"   "^ __LOC__) ()
@@ -2363,7 +2417,8 @@ let famty_ext_ind (fty: family_type typed) (fname : name) (fieldnames : name lis
   let tty = inductive_to_famtype t in 
   let ttm = fst @@ inductive_to_famterm_and_recursor_type t in 
   (* (assert_check_of_famctx t ftyctx ftyty); *)
-  famty_ext_ fty fname ((CoqIndTy ({allnames = fieldnames; indsigs_from_org_ctx = t; 
+  let name_groups = extract_groups_ident (fst t) in
+  famty_ext_ fty fname ((CoqIndTy ({name_groups; allnames = fieldnames; indsigs_from_org_ctx = t; 
                                    compiled_inddefty = ModType tty; compiled_inddef = ModType ttm;
                                    registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"register_prec" ()) registered_prec
                                    })))
@@ -2395,6 +2450,12 @@ let rec locate_in_fam_type
   
     *)
 
+(* Expand types with multiple names for search *)
+let expand_ctx = List.concat_map (fun (x, y) -> 
+  match y with 
+  | CoqIndTy {name_groups; _} -> List.map (fun (n, _) -> (n, y)) name_groups
+  | RecTy {fnames; _} -> List.map (fun x -> (x, y)) fnames
+  | _ -> [(x, y)])
 
 (* Helper function .. 
   Note that the path includes self__ at the very beginning
@@ -2413,14 +2474,15 @@ let locate_in_fam_type_withself
   (* make it into name list *)
   let _ = 
     let open Pp in  
-    Utils.msg_notice @@ (str " Finding :") ++ (Names.Id.print newhead) ++ (str "in") ++ (pr_family_ctxtype (FamCtx ctx))
+    Utils.msg_notice @@ (str " Finding: ") ++ (Names.Id.print newhead) ++ (str " in ") ++ (pr_family_ctxtype (FamCtx ctx))
   in
   let (_, one_level_deep) = smap_assoc ~einfo:(Names.Id.to_string newhead ^ "   " ^ __LOC__) newhead ctx in 
+  let one_level_deep_expanded = expand_ctx one_level_deep in
   let rest_path = 
     let part1, base = Libnames.repr_qualid tail in 
     let part1 = Names.DirPath.repr part1 in 
     (List.rev part1) @ [base] in 
-  locate_in_fam_type one_level_deep rest_path
+  locate_in_fam_type one_level_deep_expanded rest_path
 
   
 
@@ -2429,8 +2491,12 @@ let remove_latebinding (path : fieldpath) : fieldpath =
   snd (to_name_qualid path)
 
 
-
-
+let indgroup_of_indref (ctx : family_ctxtype) (indref : fieldpath) : fieldpath =
+  let t = locate_in_fam_type_withself ctx indref in 
+  match t with 
+  | CoqIndTy {name_groups = (n,_)::_; _} -> Libnames.make_qualid (Libnames.qualid_path indref) n
+  | _ -> cerror ~einfo:"Should refer to an inductive type!" ()
+  
 (* The following functions will check if a rec_mod has all the correct
     recursor handler for indtype 
     if so, 
@@ -2546,34 +2612,38 @@ let remove_latebinding (path : fieldpath) : fieldpath =
 
 (* return a term constructor and a term type checker *)
 let get_rawtm_for_recursor
-    (fname : name)
+    (fnames : name list)
     (ctx : family_ctxtype)  
     ((rec_modpath, ctx1) : fieldpath typed) 
     ((ModTerm motive, ctx2) : coqterm typed)
-    ((indtype, ctx3) : fieldpath typed)
-    (postfix : string) : (family_ctxtype -> rawterm) * (family_ctxtype -> unit) = 
+    ((indtypes, ctx3) : fieldpath list typed)
+    (postfix : string) : (family_ctxtype -> rawterm list) * (family_ctxtype -> unit) = 
     (* TODO: Add caching mechanism *)
   (* currently we only support *)
   (* assert_cerror (fun _ ->ctx = ctx1);
   assert_cerror (fun _ ->ctx = ctx2); *)
   let term_constructor_type_checker ctx = 
   let rec_modpath, ctx1 = wkinh_path (rec_modpath, ctx1) ctx in 
-  let indtype,ctx3 = wkinh_path (indtype, ctx3) ctx in 
+  let indtypes, ctx3 = List.fold_left (fun (acc, ctx) indtype -> 
+    let indtype, ctx3 = wkinh_path (indtype, ctx3) ctx in 
+    (indtype::acc, ctx3)) ([], ctx3) indtypes in
+  let indtypes = List.rev indtypes in
   (* assert_cerror (fun _ ->ctx = ctx3); *)
-  let indtypesigs =  
-    match locate_in_fam_type_withself ctx indtype with 
-    | CoqIndTy {indsigs_from_org_ctx = x, ctx4; _} -> 
+  let indtypesigs, indname_groups =  
+    match locate_in_fam_type_withself ctx (List.hd indtypes) with 
+    | CoqIndTy {indsigs_from_org_ctx = x, ctx4; name_groups = y; _} -> 
       (* generally speaking (ctx =/= ctx4); 
         because inductive type can be defined in another family
         inside a big family
       *)
-      x, ctx4
+      (x, ctx4), y
     | _ -> cerror ~einfo:__LOC__ () in 
-  let _, recursor_related = inductive_to_famterm_and_recursor_type indtypesigs in 
-  assert_cerror ~einfo:"Recursor Not Found!" (fun _ ->List.assoc_opt postfix recursor_related <> None);
-  let compiled_recursor = smap_assoc ~einfo:__LOC__ postfix @@ map_smap fst recursor_related in 
+  let indnames = List.map Libnames.qualid_basename indtypes in
+  let indtypename = concat_names indnames in
+  let compiled_recursor =
+    let _, recursor_related = inductive_to_famterm_and_recursor_type indtypesigs in 
+    fst @@ smap_assoc ~einfo:"Recursor Not Found!" (indnames, postfix) recursor_related in 
   let (ModTerm weakened_compiled_recursor, _) = wk_coq_term compiled_recursor ctx in 
-  let indtypesig = List.hd (fst indtypesigs), snd indtypesigs in 
   (* extract the constructors name
       and we construct the recursor in rawterm
       and we test the construction by constructing it
@@ -2582,39 +2652,32 @@ let get_rawtm_for_recursor
   (* Following will construct two recursor rawterm
       one for type checking (suffix with _test)
       the other one is the real construction *)
-  (* TODO: Currently only supporting single inductive type *)
-  assert_cerror ~einfo:"Currently Recursor Only Support Single Inductive Type" 
-    (fun _ ->List.length (fst indtypesig) = 1);
-  let ((_,({CAst.v = indtypename; _}, _)),_,_, all_cst), _ =  List.hd (fst indtypesig) in 
-  let recursor_name = Nameops.add_suffix (internal_version_name indtypename) postfix in 
-  let name_of_type_of_recursor = Nameops.add_prefix "__recursor_type_" (Nameops.add_suffix indtypename postfix) in 
-  let recursor_path = 
-    let open Libnames in 
-    let (prefix_of_path, _) = repr_qualid indtype in
-    make_qualid prefix_of_path recursor_name in
-  let all_cst = 
-    match all_cst with 
-    | Vernacexpr.Constructors csts -> csts 
-    | _ -> cerror ~einfo:__LOC__ () in 
-  let all_cst = List.map (fun (x,(y, z)) -> CAst.with_val (fun x -> x) y) all_cst in 
+    let recursor_names = if List.length indnames > 1 then
+      List.map (fun x -> Nameops.add_prefix (Names.Id.to_string x ^ "_") indtypename) indnames
+    else [indtypename] in
+    let recursor_names = List.map (fun x -> Nameops.add_suffix (internal_version_name x) postfix) recursor_names in 
+    let name_of_type_of_recursor = Nameops.add_prefix "__recursor_type_" (Nameops.add_suffix indtypename postfix) in 
+    let recursor_paths = 
+      let prefix_of_path = Libnames.qualid_path (List.hd indtypes) in
+      List.map (fun x -> Libnames.make_qualid prefix_of_path x) recursor_names in
+  let all_cst = List.concat_map (fun n -> smap_assoc (Libnames.qualid_basename n) indname_groups) indtypes in
   let all_projection_test = List.map (fun z -> _qualid_point_ (Some rec_modpath) z) all_cst in
   (* let all_projection = List.map remove_latebinding all_projection_test in  *)
+  let motive_names = List.map (fun fname -> Constrexpr_ops.mkIdentC @@ Nameops.add_prefix "__motiveT" fname) fnames in
   let recursor_construction  =
     let open Constrexpr_ops in 
     (* let recursor = mkRefC (remove_latebinding recursor_path) in *)
-    let recursor = mkRefC recursor_path in
+    let recursors = List.map mkRefC recursor_paths in
     (* raw term of recursor construction will have the motive in the context *)
-    let motiveName = mkIdentC @@ Nameops.add_prefix "__motiveT" fname  in
     let recur_handlers =  List.map mkRefC all_projection_test in 
-    let all_args = motiveName :: recur_handlers in 
-    let applied_rec = mkAppC (recursor, all_args) in 
+    let all_args = motive_names @ recur_handlers in 
+    let applied_rec = List.map (fun r -> mkAppC (r, all_args)) recursors in 
     applied_rec in 
   let recursor_construction_for_typechecking recursor =
     let open Constrexpr_ops in 
     (* raw term of recursor construction will have the motive in the context *)
-    let motiveName = mkIdentC @@ Nameops.add_prefix "__motiveT" fname  in
     let recur_handlers =  List.map mkRefC all_projection_test in 
-    let all_args = motiveName :: recur_handlers in 
+    let all_args = motive_names @ recur_handlers in 
     let applied_rec = mkAppC (recursor, all_args) in 
     applied_rec in 
 
@@ -2655,13 +2718,13 @@ let get_rawtm_for_recursor
 
 
 let check_recursor_validity 
-  (fname : name)
+  (fnames : name list)
   (ctx : family_ctxtype)  
   (rec_mod : fieldpath typed) 
-  (motive : coqterm typed)
-  (indtype : fieldpath typed)
+  (motives : coqterm typed)
+  (indtypes : fieldpath list typed)
   (postfix : string) : unit =
-  let _ = get_rawtm_for_recursor fname ctx rec_mod motive indtype postfix in ()
+  let _ = get_rawtm_for_recursor fnames ctx rec_mod motives indtypes postfix in ()
 
 
 (* if a motive has type P = (fun x -> P x)
@@ -2669,10 +2732,10 @@ let check_recursor_validity
 
   we also have some quirks here, we allow the compiled motiveT
   *)
-let get_recty_from_motive fname 
+let get_recty_from_motive (fnames : name list) 
   ?(motiveTpathprefix = (None : fieldpath option))
-  ((motive, ctx) : coqterm typed)
-   =
+  ((motive, ctx) : coqterm typed) :
+  coqtype typed =
   let parameters = famctx_to_parameters_selfprefix ctx in 
   let rec get_parameter_number_of_product (t : Constr.constr) : int =
     let open Constr in 
@@ -2682,7 +2745,7 @@ let get_recty_from_motive fname
     else 0 in
   let open CoqVernacUtils in 
   ModType (runVernac @@ 
-          define_moduletype (freshen_name ~prefix:fname ()) parameters 
+          define_moduletype (freshen_name ~prefix:(concat_names fnames) ()) parameters 
           (fun ctx ->
             (* Given Motive P here *)
             (* Construct Parameter fname : forall ..., P .. *)
@@ -2691,55 +2754,56 @@ let get_recty_from_motive fname
             let open Constrexpr in 
             let ModTerm motive = motive in 
             let applied_motive = apply_mods (pure motive) ctx in 
-            let* _ = include_mod applied_motive in 
-            let motiveT =  (Nameops.add_prefix "__motiveT" fname) in 
-            (* Attach prefix if specified *)
-            let motiveT =
-              let full_path = 
-              match motiveTpathprefix with 
-              | None -> Libnames.qualid_of_ident motiveT 
-              | Some prefix -> _qualid_point_ motiveTpathprefix motiveT
-              in 
-              mkRefC full_path
-            in
-            thunk 
-            (* We have to wrap the following into a thunk 
-              because the following must be evaluated inside 
-              the constructed module
-              *)
-            (fun () ->
-              let parameter_number = get_parameter_number_of_product @@ type_check motiveT in 
-              let vars = 
-                List.map (fun x -> 
-                            Names.Id.of_string @@
-                            "v" ^ string_of_int x) @@
-                List.init parameter_number (fun x -> x + 1) in
-              let binders = 
-                List.map (fun x ->
-                            CAst.make @@ Names.Name.mk_name x) vars in 
-              let binders = 
-                List.map 
-                (fun x -> 
-                    CLocalAssum ([x], Default Glob_term.Explicit, 
-                      CAst.make @@ CHole (None, Namegen.IntroAnonymous, None))) binders in 
-              let funcbody = mkAppC (motiveT,(List.map mkIdentC vars)) in 
-              let prodtype = mkProdCN binders funcbody in 
-              assume_parameter fname prodtype
-            ) 
+            let* _ = include_mod applied_motive in
+            flatmap @@ List.map (fun fname ->
+              let motiveT = Nameops.add_prefix "__motiveT" fname in
+              (* Attach prefix if specified *)
+              let motiveT =
+                let full_path = 
+                match motiveTpathprefix with 
+                | None -> Libnames.qualid_of_ident motiveT 
+                | Some prefix -> _qualid_point_ motiveTpathprefix motiveT
+                in 
+                mkRefC full_path
+              in
+              thunk 
+              (* We have to wrap the following into a thunk 
+                because the following must be evaluated inside 
+                the constructed module
+                *)
+              (fun () ->
+                let parameter_number = get_parameter_number_of_product @@ type_check motiveT in 
+                let vars = 
+                  List.map (fun x -> 
+                              Names.Id.of_string @@
+                              "v" ^ string_of_int x) @@
+                  List.init parameter_number (fun x -> x + 1) in
+                let binders = 
+                  List.map (fun x ->
+                              CAst.make @@ Names.Name.mk_name x) vars in 
+                let binders = 
+                  List.map 
+                  (fun x -> 
+                      CLocalAssum ([x], Default Glob_term.Explicit, 
+                        CAst.make @@ CHole (None, Namegen.IntroAnonymous, None))) binders in 
+                let funcbody = mkAppC (motiveT,(List.map mkIdentC vars)) in 
+                let prodtype = mkProdCN binders funcbody in 
+                assume_parameter fname prodtype
+            )) fnames
             (* Then we include computational axiom *)
 
     )), ctx
 
 let get_coqty_for_recursor
-  (fname : name)
+  (fnames : name list)
   (ctx : family_ctxtype)
   (rec_mod : fieldpath typed) 
   ((motive, ctx2) : coqterm typed)
-  (indtype : fieldpath typed) 
+  (indtype : fieldpath list typed) 
   (postfix : string): coqtype typed = 
   (* TODO: Add caching mechanism *)
-  check_recursor_validity fname ctx rec_mod (motive,ctx) indtype postfix; 
-  get_recty_from_motive fname (motive, ctx)
+  check_recursor_validity fnames ctx rec_mod (motive,ctx) indtype postfix; 
+  get_recty_from_motive fnames (motive, ctx)
 
 
 (* this will return the "abstracted" recursor type 
@@ -2766,7 +2830,8 @@ let get_recursor_type_for_indref
       | _ -> cerror ~einfo:"Should refer to an inductive type!" () in
   let original_rect_recursor = 
     let _, recursors = inductive_to_famterm_and_recursor_type indsig in 
-    let (ModTerm rect_recursor, _), _ = smap_assoc ~einfo:__LOC__ suffix recursors in 
+    let indname = Libnames.qualid_basename indref in
+    let (ModTerm rect_recursor, _), _ = smap_assoc ~einfo:__LOC__ ([indname], suffix) recursors in 
     rect_recursor
   in 
   let original_ind_rect_type = 
@@ -2797,8 +2862,9 @@ let get_recursor_type_for_indref
    *)
 let calculate_computational_axiom_for_rec_constructor 
     ~(recursorref : fieldpath)
-    ~(indref : fieldpath)
-    ~(constrref : fieldpath) : (name * rawterm) = 
+    ~(indrefs : fieldpath list)
+    ~(constrref : fieldpath)
+    ~(recursorrefs : fieldpath list) : (name * rawterm) = 
   (* we enter the module to get the environment *)
   let open Constrexpr_ops in 
   let open Constrexpr in 
@@ -2807,13 +2873,12 @@ let calculate_computational_axiom_for_rec_constructor
       fully_applied (mkRefC constrref) in 
   (* now we have (constrref ?v1 ...) *) 
 
-
   (* we also need to make recursor fully applied later, so we collect the parameter type of recursor and remove the first parameter *)
   
   let recursor_parameter, _ =            
       collect_argument_and_ret_of_type @@ 
       reflect_safeterm @@
-      type_check (mkRefC recursorref) in 
+      type_check (mkRefC recursorref) in
   let recursor_parameter_wo_first = 
       List.tl recursor_parameter in 
   let recursor_remained_arguments = 
@@ -2827,23 +2892,34 @@ let calculate_computational_axiom_for_rec_constructor
      recursorref (constrref ?v1 ?v2 ...) *)
   let recursor_applied = mkAppC ((mkRefC recursorref),fully_applied_constr::recursor_remained_arguments) in 
   (* then we need second fully applied, to make sure recursor doesn't need more argument *)
-          
   let eq_cstr = mkRefC @@ Libnames.qualid_of_ident @@ Names.Id.of_string "eq" in 
   let id_on_fully_applied_r =  mkAppC (eq_cstr, [recursor_applied;recursor_applied]) in  
   (* and we close it and normalize it to get the final result *)
   let closed_recursor_applied = 
     List.fold_right (fun (a, b, c) body -> mkProdC (a,b,c, body)) (List.map fst params) id_on_fully_applied_r  in
-   (*Then we internalize it for sanity and normalize it *)
-
+  (* Then we internalize it for sanity and normalize it *)
+  
   let res = 
-    let reflected = reflect_safeterm (cbn_term closed_recursor_applied) in 
-
-    (* let reflected = reflect_safeterm (Utils.cbv_beta closed_recursor_applied) in  *)
-     (* then we extract the body *)
+    let reflected = reflect_safeterm (cbn_term closed_recursor_applied) in
+    (* we have to substitute in the other recursors, so we look for fixpoints with matching motives *)
+    let rec subst_other_recs () ({CAst.v = t; _} as f : constr_pattern_expr) =
+      match t with
+      | CFix ({CAst.v = x; _}, ls)
+        when List.for_all (fun ((_,_,_,{CAst.v = d; _},_), r) ->
+          match d with
+        | CApp ({CAst.v = CRef (m, _); _}, [_]) ->
+          Libnames.qualid_basename m = Nameops.add_prefix "__motiveT" (Libnames.qualid_basename r)
+        | _ -> false) (List.combine ls recursorrefs)
+        && List.length ls = List.length recursorrefs -> 
+        mkRefC (List.assoc x (List.combine (List.map (fun ({CAst.v = a; _},_,_,_,_) -> a) ls) recursorrefs))
+      | _ -> map_constr_expr_with_binders (fun _ _ -> ()) subst_other_recs () f
+    in
+    let reflected = subst_other_recs () reflected in
+    (* then we extract the body *)
     let _, body = collect_argument_and_ret_of_type reflected in 
     let _ = 
       let open Pp in 
-      Utils.msg_notice @@ (str __LOC__ ) ++ pr_constr_expr reflected 
+      Utils.msg_notice @@ (str "reflected: " ) ++ pr_constr_expr reflected 
     in 
     let isEq {CAst.v = t; _} = match t with | CNotation (_, (_, "_ = _"), _) -> true | _ -> false in
     assert_cerror_forced ~einfo:__LOC__ 
@@ -2870,22 +2946,23 @@ let calculate_computational_axiom_for_rec_constructor
   for one recursor and the constructor  *)
 let generate_computational_axiom_for_rec_constructor 
   (ctx : family_ctxtype) 
-  ~(recursorref : fieldpath)
-  ~(indref : fieldpath)
-  (constrrefs : fieldpath list) : (name * rawterm) list = 
+  ~(recursorrefs : fieldpath list)
+  ~(indrefs : fieldpath list)
+  (constrrefs : fieldpath list list) : (name * rawterm) list = 
+  let indgroup = indgroup_of_indref ctx (List.hd indrefs) in
   let parameters = 
     let ov_exposed = 
-      Set_Fieldpath.add recursorref @@
-      Set_Fieldpath.add indref @@ Set_Fieldpath.empty in 
+      Set_Fieldpath.add (List.hd recursorrefs) @@
+      Set_Fieldpath.add indgroup @@ Set_Fieldpath.empty in 
     famctx_to_parameters_selfprefix ~ov_exposed ctx in
   (* we enter the module to get the environment *)
   (* let open Constrexpr_ops in  *)
   (* let rawconstrref = mkRefC constrref in  *)
   let open CoqVernacUtils in 
   let final_result = ref [] in 
-  let for_each_constrref (constrref : fieldpath) =
+  let for_each_constrref (recursorref : fieldpath) (constrref : fieldpath) =
     let name, equation = 
-      calculate_computational_axiom_for_rec_constructor ~recursorref ~indref ~constrref in 
+      calculate_computational_axiom_for_rec_constructor ~recursorref ~indrefs ~constrref ~recursorrefs in 
     final_result := (name, equation)::(!final_result);
     return ()
   in
@@ -2894,7 +2971,7 @@ let generate_computational_axiom_for_rec_constructor
   define_module (fresh_name ()) parameters
   (fun ctx -> 
     let for_all_constrref () = 
-      let allcommnds = List.map for_each_constrref constrrefs in 
+      let allcommnds = List.concat_map (fun (r, cs) -> List.map (fun c -> for_each_constrref r c) cs) (List.combine recursorrefs constrrefs) in 
       CoqVernacUtils.flatmap allcommnds in 
     thunk for_all_constrref
     ) in 
@@ -2949,7 +3026,8 @@ let open CoqVernacUtils in
       _qualid_point_ pathprefix base 
     in 
     (* we get the definition of the recursor *)
-    let ov_exposed = Set_Fieldpath.add indref Set_Fieldpath.empty in 
+    let indgroup = indgroup_of_indref ctx indref in
+    let ov_exposed = Set_Fieldpath.add indgroup Set_Fieldpath.empty in 
     let exposed_parameters = famctx_to_parameters_selfprefix ~ov_exposed ctx in 
     let result = ref None in 
     let _ = 
@@ -3163,78 +3241,74 @@ let open CoqVernacUtils in
   for the computational axiom of the inductive type  *)
 let generate_computational_axiom_for_rec
   (ctx : family_ctxtype) 
-  ~(recursorref : fieldpath)
-  ~(indref : fieldpath) : coqtype * coqterm = 
-  let open CoqVernacUtils in 
+  ~(recursorrefs : fieldpath list)
+  ~(indrefs : fieldpath list) : coqtype * coqterm = 
+  let recursorref = List.hd recursorrefs in
+  let indref = List.hd indrefs in
   let modname = 
     let _, recname = to_qualid_name recursorref in  
     let _, indname = to_qualid_name indref in 
     let indname = Names.Id.to_string indname in 
     Nameops.add_suffix recname (indname) in 
-  let generate_computational_axiom_for_rec_
-    (ctx : family_ctxtype) 
-    ~(recursorref : fieldpath)
-    ~(indref : fieldpath) : coqtype * coqterm = 
-    let exposed_parameters = 
-      let ov_exposed = 
-        Set_Fieldpath.add recursorref @@
-        Set_Fieldpath.add indref @@ Set_Fieldpath.empty in 
-      famctx_to_parameters_selfprefix ~ov_exposed ctx in
-    let parameters = 
-      famctx_to_parameters_selfprefix  ctx in
-    let auto_tactic : rawterm_or_tactics = 
-      let script : Tacexpr.raw_tactic_expr = 
-        (CAst.make (Tacexpr.TacArg (Tacexpr.TacCall (CAst.make ( Libnames.qualid_of_ident (Names.Id.of_string "eauto") ,[]))) )) in 
-      ProofScript {script; starting_plain = true; opacity = Vernacexpr.Opaque} in
-    (* Detect we are about partial recursor or normal recursor 
-        normal-recursor -- we use generate_computational_axiom_for_rec_constructor
-        partial-recursor -- otherwise
-      *)
-    let is_normal_recursor : [`NormalRec | `PRec of int ] = 
-      let recty = locate_in_fam_type_withself ctx recursorref in 
-      match recty with 
-      | RecTy _ -> `NormalRec 
-      | PRecTy {cstrs; _} -> `PRec (List.length cstrs)
-      | _ -> cerror ~einfo:__LOC__ ()
-      in 
-    let name_axiom_pairs = 
-      match is_normal_recursor with 
-      | `NormalRec -> 
-        begin 
-          let cstrrefs = 
-            let indsig = 
-                match locate_in_fam_type_withself ctx indref with 
-                | CoqIndTy {indsigs_from_org_ctx = x; _} -> 
-                  x
-                | _ -> cerror ~einfo:__LOC__ () in 
-            let all_cstrs_indent = extract_cstrs_ident (fst indsig) in
-            let path_prefix, _ = to_qualid_name indref in  
-            let all_cstr_refs = List.map (_qualid_point_ path_prefix) all_cstrs_indent in 
-            all_cstr_refs in 
-          generate_computational_axiom_for_rec_constructor ctx ~recursorref ~indref cstrrefs 
-        end 
-      | `PRec valid_parameters ->
-        generate_computational_axiom_for_prec ctx ~precref:recursorref ~indref valid_parameters
+  let exposed_parameters = 
+    let indgroup = indgroup_of_indref ctx indref in
+    let ov_exposed = 
+      Set_Fieldpath.add recursorref @@
+      Set_Fieldpath.add indgroup @@ Set_Fieldpath.empty in 
+    famctx_to_parameters_selfprefix ~ov_exposed ctx in
+  let parameters = 
+    famctx_to_parameters_selfprefix  ctx in
+  let auto_tactic : rawterm_or_tactics = 
+    let script : Tacexpr.raw_tactic_expr = 
+      (CAst.make (Tacexpr.TacArg (Tacexpr.TacCall (CAst.make ( Libnames.qualid_of_ident (Names.Id.of_string "eauto") ,[]))) )) in 
+    ProofScript {script; starting_plain = true; opacity = Vernacexpr.Opaque} in
+  (* Detect we are about partial recursor or normal recursor 
+      normal-recursor -- we use generate_computational_axiom_for_rec_constructor
+      partial-recursor -- otherwise
+    *)
+  let is_normal_recursor: [`NormalRec | `PRec of int ] = 
+    let recty = locate_in_fam_type_withself ctx recursorref in 
+    match recty with 
+    | RecTy _ -> `NormalRec
+    | PRecTy {cstrs; _} -> `PRec (List.length cstrs)
+    | _ -> cerror ~einfo:__LOC__ ()
     in 
-    (* we first generate module type *)
-    let modtype = 
-      runVernac @@
-      define_moduletype (freshen_name ~prefix:modname ()) parameters
-      (* the we generate module term for given type *)
-      (fun ctx -> 
-        let for_each_pair (n, ty) =
-          assume_parameter n ty in 
-        flatmap (List.map for_each_pair name_axiom_pairs)) in 
-    let modterm = 
-      runVernac @@
-      define_module (freshen_name ~prefix:modname ()) exposed_parameters
-      (* the we generate module term for given type *)
-      (fun ctx -> 
-        let for_each_pair (n, ty) =
-          thunk (construct_term_using_rawterm_or_proof n auto_tactic ty) in 
-        flatmap (List.map for_each_pair name_axiom_pairs)) in 
-      (ModType modtype, ModTerm modterm) in 
-  generate_computational_axiom_for_rec_ ctx ~recursorref ~indref
+  let name_axiom_pairs = 
+    match is_normal_recursor with 
+    | `NormalRec -> 
+      begin 
+        let cstrrefs = 
+          let indname_groups = 
+              match locate_in_fam_type_withself ctx indref with 
+              | CoqIndTy {name_groups = x; _} -> 
+                x
+              | _ -> cerror ~einfo:__LOC__ () in 
+          let path_prefix, _ = to_qualid_name indref in  
+          List.map (fun x -> (List.map (_qualid_point_ path_prefix) (List.assoc (Libnames.qualid_basename x) indname_groups))) indrefs in 
+        generate_computational_axiom_for_rec_constructor ctx ~recursorrefs ~indrefs cstrrefs 
+      end 
+    | `PRec valid_parameters ->
+      generate_computational_axiom_for_prec ctx ~precref:recursorref ~indref valid_parameters
+  in 
+  (* we first generate module type *)
+  let open CoqVernacUtils in
+  let modtype = 
+    runVernac @@
+    define_moduletype (freshen_name ~prefix:modname ()) parameters
+    (* the we generate module term for given type *)
+    (fun ctx -> 
+      let for_each_pair (n, ty) =
+        assume_parameter n ty in 
+      flatmap (List.map for_each_pair name_axiom_pairs)) in 
+  let modterm = 
+    runVernac @@
+    define_module (freshen_name ~prefix:modname ()) exposed_parameters
+    (* then we generate module term for given type *)
+    (fun ctx ->
+      let for_each_pair (n, ty) =
+        thunk (construct_term_using_rawterm_or_proof n auto_tactic ty) in 
+      flatmap (List.map for_each_pair name_axiom_pairs)) in 
+  (ModType modtype, ModTerm modterm)
 
 
 
@@ -3527,7 +3601,8 @@ let generate_partial_recursor_tm
     let arg = Genarg.in_gen (Genarg.rawwit Tacarg.wit_tactic) tac in
       CAst.make @@ CHole (None, IntroAnonymous, Some arg) in 
   let modterm = 
-    let ov_exposed = Set_Fieldpath.add indref @@ Set_Fieldpath.empty in 
+    let indgroup = indgroup_of_indref ctx indref in
+    let ov_exposed = Set_Fieldpath.add indgroup @@ Set_Fieldpath.empty in 
     let exposed_parameters = famctx_to_parameters_selfprefix ~ov_exposed ctx in 
     let eT = Some indprec_ty in 
     runVernac @@
@@ -3600,21 +3675,28 @@ precname
         return ())) in
   ModTerm combined_mod *)
 
-
-let inhnewrec (i : inh) (fname : name) 
-(newctx : family_ctxtype)
-((rec_mod, ctx1) : fieldpath typed) (motive : coqterm typed) ((indtype, ctx2) : fieldpath typed) (postfix : string) : inh = 
+let inhnewrec
+  (i : inh) (fnames: name list)
+  (newctx : family_ctxtype)
+  ((rec_mod, ctx1) : fieldpath typed)
+  (motives : coqterm typed)
+  ((indrefs, ctx2) : fieldpath list typed)
+  (postfix : string) 
+  : inh =
   let ((inp, oup), ctx), inhs = i in 
-  (* TODO: Sanity Check about linkage shape *)
-  let newtype = get_coqty_for_recursor fname newctx (rec_mod, ctx1) motive (indtype,ctx2) postfix in 
-  let newrtm, newrtm_checker = get_rawtm_for_recursor fname newctx (rec_mod, ctx1) motive (indtype, ctx2) postfix in 
+  let newtype = get_coqty_for_recursor fnames newctx (rec_mod, ctx1) motives (indrefs,ctx2) postfix in 
+  let newrtm, newrtm_checker = get_rawtm_for_recursor fnames newctx (rec_mod, ctx1) motives (indrefs, ctx2) postfix in 
   newrtm_checker newctx;
-  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (RecTy {recty = newtype; recursordef = rec_mod; inductivedef = indtype; motive = motive; rawrecdef = (newrtm, newctx); postfix}) in
+  let fname = List.hd fnames in
+  let (newoup, ctxb) =
+    famty_ext_ (oup, ctx) fname
+    (RecTy {fnames; recty = newtype; recursordef = rec_mod;
+            inductivedefs = indrefs;
+            motive = motives; rawrecdef = (newrtm, newctx); postfix}) in
   let dummy_field_path = Libnames.qualid_of_string "UNDEFINED" in 
-  let newinhs = (fname, CInhNew ( ModTerm (dummy_field_path), ctx ))  :: inhs in 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb);
+  let newinhs = (fname, CInhNew ( ModTerm (dummy_field_path), ctx)) :: inhs in 
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb); *)
   ((inp, newoup), ctx), newinhs 
-
 
 let inhnewprec 
   (i : inh) (fname : name)
@@ -3644,27 +3726,26 @@ let inhnewprec
   ((inp, newoup), FamCtx ctx), newinhs 
 
 let inhnewrec2d 
-  (i : inh) (fname : name)
-  recursorref indref  = 
+  (i : inh) (fnames : name list)
+  recursorrefs indrefs  = 
+  let fname = List.hd fnames in
   let ((inp, oup), FamCtx ctx), inhs = i in 
   (* let oldctx = FamCtx ((fname, inp)::ctx) in  *)
   let newctx = FamCtx (((fst (fst oup)), oup)::ctx) in  
   (* TODO : make context correct for motive, indref, recty *)
 
-  let inductivedef = indref in 
-  let recursordef = recursorref, newctx in 
+  let inductivedefs = indrefs in 
+  let recursordefs = recursorrefs, newctx in 
   (* check if recursor is partial recursor or normal recursor *)
-  let rec2dty, rec2dtm = generate_computational_axiom_for_rec newctx ~recursorref ~indref in 
+  let rec2dty, rec2dtm = generate_computational_axiom_for_rec newctx ~recursorrefs ~indrefs in 
   let newty = 
-
     let compiledtype = rec2dty, newctx in 
     let compiledterm = rec2dtm in 
-    Rec2DTy {inductivedef; recursordef; compiledterm; compiledtype} in 
+    Rec2DTy {inductivedefs; recursordefs; compiledterm; compiledtype} in 
   (* TODO : Check it is well-typed *)
   let (newoup, ctxb) = famty_ext_ (oup, FamCtx ctx) fname newty in
   let newinhs = (fname, CInhNew (rec2dtm, newctx))  :: inhs in 
   ((inp, newoup), FamCtx ctx), newinhs 
-
 
 
 (* Check if a given is inside a given basis  *)
@@ -3722,15 +3803,16 @@ let inhnewind (i : inh) (fname : name) ((inddef,ictx) : coq_ind_sig typed) : inh
   let ((inp, oup), ctx), inhs = i in 
   (* TODO: Sanity Check about linkage shape *)
   let all_fields = extract_all_ident [inddef] in 
+  let name_groups = extract_groups_ident [inddef] in
   let indsigs_from_org_ctx =  [inddef], ictx in 
   let inddef_modtype = inductive_to_famtype indsigs_from_org_ctx in 
   let inddef_mod = fst @@ inductive_to_famterm_and_recursor_type indsigs_from_org_ctx in 
-  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (CoqIndTy ({allnames = all_fields; indsigs_from_org_ctx; 
+  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (CoqIndTy ({name_groups; allnames = all_fields; indsigs_from_org_ctx; 
                                                                compiled_inddefty = ModType inddef_modtype; compiled_inddef = ModType inddef_mod;
-                                                               registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"registered_prec" ()) None})) in 
+                                                               registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"registered_prec" ()) []})) in 
   let newinhs = (fname , CInhNew (ModTerm inddef_mod, ictx)) :: inhs in
 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb); 
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb);  *)
   ((inp, newoup), ctx), newinhs
 
 
@@ -3743,85 +3825,55 @@ let inhextendind (i : inh) (fname : name) ((parentinddef, oldctx) : coq_ind_sigs
   (* TODO: Sanity Check about linkage shape *)
   let newinhs = (fname , CInhExtendInd ((newinddef::parentinddef, current_ctx), incrementpart) ) :: inhs in
   let all_fields = extract_all_ident (newinddef :: parentinddef) in 
+  let name_groups = extract_groups_ident (newinddef :: parentinddef) in
   let indsigs_from_org_ctx = (newinddef::parentinddef), current_ctx in 
   let inddef_modtype = inductive_to_famtype indsigs_from_org_ctx in 
   let inddef_mod = fst @@ inductive_to_famterm_and_recursor_type indsigs_from_org_ctx in 
   let parent_ind_fields = extract_all_ident parentinddef in 
   let (newinp, ctxa) = famty_ext_ind (inp, ctx) fname parent_ind_fields (parentinddef, oldctx) registered_prec  in 
-  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (CoqIndTy ({allnames = all_fields; indsigs_from_org_ctx; 
+  let (newoup, ctxb) = famty_ext_ (oup, ctx) fname (CoqIndTy ({name_groups; allnames = all_fields; indsigs_from_org_ctx; 
                                                                compiled_inddefty = ModType inddef_modtype; compiled_inddef = ModType inddef_mod;
                                                                registered_prec = Summary.ref ~name:(Utils.fresh_string ~prefix:"registered_prec" ()) registered_prec
                                                                })) in 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb); 
-  assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxa); 
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxb);  *)
+  (* assert_cerror ~einfo:"Context Should not change" (fun _ ->ctx = ctxa);  *)
 
   ((newinp, newoup), ctx), newinhs
 
-
-
-
-let check_compatible_indsig_for_newcstrs (parent_ind_trace, oldctx : coq_ind_sigs typed) ((newdef, current_ctx) : coq_ind_sig typed) : coq_ind_sig typed =     
-    (* first check any name confliction -- we can also directly let
-          Coq check it for us *)
-    let parent_ind =   List.hd parent_ind_trace in
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> List.length parent_ind = 1);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> List.length newdef = 1);
-    (* No mutual inductive type *)
-    let parent_ind = List.hd parent_ind in 
-    let newinddefs = List.hd newdef in 
-    (* don't allow notation *)
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd parent_ind = []);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd newinddefs = []);
-    (* sanity check on newcstrs *)
-    let ((_, (old_name, univinfo)), _, _, oldcstrs) = fst parent_ind in 
-    let ((wtc, (newcstrs_typename, _)), newparams, newty, newcstrs) = fst newinddefs in 
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> 
-      CAst.with_val (fun x -> x) newcstrs_typename = CAst.with_val (fun x->x) old_name);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> newparams = ([],None));
-    let childcstrs = 
-      match oldcstrs, newcstrs with 
-      | Vernacexpr.Constructors a, Vernacexpr.Constructors b -> 
-        let a, _ = rename_ind_cstrs_ctx (a, oldctx) current_ctx in
-        Vernacexpr.Constructors (a @ b)
-      | _, _ -> cerror ~einfo:("Expect Inductive Constructor!"^__LOC__) () 
-    in 
-    (* type of child_ind = type of (fst parent_ind) *)
-    let child_ind = ((wtc, (newcstrs_typename, univinfo)), newparams, newty, childcstrs) in 
-    let child_ind_def = ([(child_ind, [])]) in 
-    (child_ind_def, current_ctx)
-
-let combine_indsig_for_newcstrs (parent_ind, oldctx : coq_ind_sig typed) ((newdef, current_ctx) : coq_ind_sig typed) : coq_ind_sig typed =     
-    (* first check any name confliction -- we can also directly let
-          Coq check it for us *)
-    (* let parent_ind =   List.hd parent_ind_trace in *)
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> List.length parent_ind = 1);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> List.length newdef = 1);
-    (* No mutual inductive type *)
-    let parent_ind = List.hd parent_ind in 
-    let newinddefs = List.hd newdef in 
-    (* don't allow notation *)
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd parent_ind = []);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd newinddefs = []);
-    (* sanity check on newcstrs *)
-    let ((_, (old_name, univinfo)), _, _, oldcstrs) = fst parent_ind in 
-    let ((wtc, (newcstrs_typename, _)), newparams, newty, newcstrs) = fst newinddefs in 
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> 
-      CAst.with_val (fun x -> x) newcstrs_typename = CAst.with_val (fun x->x) old_name);
-    assert_cerror_forced ~einfo:__LOC__ (fun _ -> newparams = ([],None));
-    let childcstrs = 
-      match oldcstrs, newcstrs with 
-      | Vernacexpr.Constructors a, Vernacexpr.Constructors b -> 
-        let a, _ = rename_ind_cstrs_ctx (a, oldctx) current_ctx in
-        Vernacexpr.Constructors (a @ b)
-      | _, _ -> cerror ~einfo:("Expect Inductive Constructor!"^__LOC__) () 
-    in 
-    (* type of child_ind = type of (fst parent_ind) *)
-    let child_ind = ((wtc, (newcstrs_typename, univinfo)), newparams, newty, childcstrs) in 
-    let child_ind_def = ([(child_ind, [])]) in 
-    (child_ind_def, current_ctx)
-
-let inhextendind_incrementally (current_inh : inh) (fname : name) ((parent_ind, oldctx) : coq_ind_sigs typed) (incre_ind_typed : coq_ind_sig typed) registered_prec : inh =   
   
+let combine_indsig_for_newcstrs (parent_ind, oldctx : coq_ind_sig typed) ((newdef, current_ctx) : coq_ind_sig typed) : coq_ind_sig typed =
+  (* first check any name confliction -- we can also directly let
+        Coq check it for us *)
+  let child_ind_defs =
+    (List.combine parent_ind newdef)
+    |> List.map (fun (parent_ind, newinddefs) ->
+      (* don't allow notation *)
+      assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd parent_ind = []);
+      assert_cerror_forced ~einfo:__LOC__ (fun _ -> snd newinddefs = []);
+      (* sanity check on newcstrs *)
+      let ((_, (old_name, univinfo)), _, _, oldcstrs) = fst parent_ind in 
+      let ((wtc, (newcstrs_typename, _)), newparams, newty, newcstrs) = fst newinddefs in 
+      assert_cerror_forced ~einfo:__LOC__ (fun _ -> 
+        CAst.with_val (fun x -> x) newcstrs_typename = CAst.with_val (fun x->x) old_name);
+      assert_cerror_forced ~einfo:__LOC__ (fun _ -> newparams = ([],None));
+      let childcstrs = 
+        match oldcstrs, newcstrs with 
+        | Vernacexpr.Constructors a, Vernacexpr.Constructors b -> 
+          let a, _ = rename_ind_cstrs_ctx (a, oldctx) current_ctx in
+          Vernacexpr.Constructors (a @ b)
+        | _, _ -> cerror ~einfo:("Expect Inductive Constructor!"^__LOC__) () 
+      in 
+      (* type of child_ind = type of (fst parent_ind) *)
+      let child_ind = ((wtc, (newcstrs_typename, univinfo)), newparams, newty, childcstrs) in 
+      (child_ind, [])
+    ) in
+  (child_ind_defs, current_ctx)
+
+let check_compatible_indsig_for_newcstrs (parent_ind_trace, oldctx : coq_ind_sigs typed) ((newdef, current_ctx) : coq_ind_sig typed) : coq_ind_sig typed =
+  let parent_ind = List.hd parent_ind_trace in
+  combine_indsig_for_newcstrs (parent_ind, oldctx) (newdef, current_ctx)
+
+let inhextendind_incrementally (current_inh : inh) (fname : name) ((parent_ind, oldctx) : coq_ind_sigs typed) (incre_ind_typed : coq_ind_sig typed) registered_prec : inh =
   let complete_def, current_ctx = check_compatible_indsig_for_newcstrs (parent_ind, oldctx) incre_ind_typed in
   let _ = inductive_to_famterm_and_recursor_type (complete_def :: parent_ind, current_ctx) in 
   let _ = inductive_to_famtype (complete_def :: parent_ind, current_ctx) in 
@@ -3964,7 +4016,7 @@ let family_type_rename ((oldname, flist) : family_type) (newname : fam_name) : f
 (* will do weakening on components
     but will signal exception when applies to famty *)
 let wkinh_coqtype_deep 
-fname (* This is used during precty *)
+(fname : name) (* This is used during precty *)
 ~(postpone_exhaustiveness_checking : bool) (* This is when mixin recursor but recursor is not ready *)
 ((f, ctx) : family_type_or_coq_type typed) 
 (newctx : family_ctxtype) : family_type_or_coq_type typed = 
@@ -3981,41 +4033,44 @@ begin match f with
 | CoqIndTy ({indsigs_from_org_ctx; _} as tT) ->
   let indsigs_from_org_ctx = wkinh_indsigs indsigs_from_org_ctx newctx in 
   (CoqIndTy {tT with indsigs_from_org_ctx}, newctx)
-| RecTy ({recursordef ; inductivedef ; motive; recty; rawrecdef; postfix; _}) ->
+| RecTy ({fnames; recursordef ; inductivedefs; motive; recty; rawrecdef; postfix; _}) ->
   let oldctx = snd rawrecdef in 
   let recursordef = fst @@ wkinh_path (recursordef, oldctx) newctx in 
-  let inductivedef = fst @@ wkinh_path (inductivedef, oldctx) newctx in 
+  let inductivedefs = List.map (fun inductivedef -> fst (wkinh_path (inductivedef, oldctx) newctx)) inductivedefs in
   let motive = wkinh_coq_term motive newctx in 
   let recty = wkinh_coq_type recty newctx in 
-  let newrtm, rtm_checker = get_rawtm_for_recursor fname newctx (recursordef, newctx) motive (inductivedef, newctx) postfix in 
+  let newrtm, rtm_checker =
+    get_rawtm_for_recursor fnames newctx (recursordef, newctx) motive (inductivedefs, newctx) postfix in 
   (* do a checking here *)
   if (not postpone_exhaustiveness_checking) then rtm_checker newctx else ();
   (* The implementation detail here needs some extra consideration *)
-  RecTy {recty ; recursordef; inductivedef ; motive ; rawrecdef = (newrtm, newctx); postfix}, newctx
-| Rec2DTy ({recursordef; inductivedef ; _}) ->
+  RecTy {fnames; recty ; recursordef; inductivedefs; motive; rawrecdef = (newrtm, newctx); postfix}, newctx
+| Rec2DTy ({recursordefs; inductivedefs ; _}) ->
   let open Pp in 
   Utils.msg_notice (str "(* Inheriting Rec2D in wkinh_coqtype_deep ..." ++ (Names.Id.print fname) ++ str "*)");
-  let oldctx = snd recursordef in 
-  let recursordef = wkinh_path recursordef newctx in
-  let inductivedef = fst @@ wkinh_path (inductivedef, oldctx) newctx in 
+  let oldctx = snd recursordefs in 
+  let recursordefs, recctxs = List.split (List.map (fun recursordef -> wkinh_path (recursordef, oldctx) newctx) (fst recursordefs)) in
+  let recursordefs = recursordefs, List.hd recctxs in
+  let inductivedefs = List.map (fun inductivedef -> fst (wkinh_path (inductivedef, oldctx) newctx)) inductivedefs in
   (* always regenerate ... because the constructors might be more *)
   let new2dty, new2dtm = 
-    let indref = inductivedef in 
-    let recursorref = fst recursordef in 
-    generate_computational_axiom_for_rec newctx ~recursorref ~indref  in
+    let indrefs = inductivedefs in 
+    let recursorrefs = fst recursordefs in 
+    generate_computational_axiom_for_rec newctx ~recursorrefs ~indrefs  in
   let compiledterm = new2dtm in 
   let compiledtype = new2dty, newctx in  
-    Rec2DTy {inductivedef; recursordef; compiledtype; compiledterm}, newctx
+    Rec2DTy {inductivedefs; recursordefs; compiledtype; compiledterm}, newctx
 | PRecTy ({inductivedef; precrawty; cstrs; _} as tT) -> 
   let inductivedef = wkinh_path inductivedef newctx in 
   let precrawty = wkinh_rawterm precrawty newctx in 
   let ModTerm prectm = generate_partial_recursor_tm fname newctx (fst inductivedef) (fst precrawty) (List.length cstrs) in
   let prectm = ModType prectm in 
   PRecTy {tT with inductivedef; prectm; precrawty}, newctx 
-| FTheoremTy ({indref; recty ; _ } as tT) -> 
-  let indref = wkinh_path indref newctx in
-  let recty  = wkinh_coq_type  recty newctx in 
-  FTheoremTy {tT with indref; recty}, newctx
+| FTheoremTy ({indrefs; recty ; _ } as tT) ->
+  let indrefs = List.map (fun indref -> wkinh_path (indref, (snd indrefs)) newctx) (fst indrefs) in 
+  let indrefs = List.map fst indrefs, snd (List.hd indrefs) in
+  let recty  = wkinh_coq_type recty newctx in 
+  FTheoremTy {tT with indrefs; recty}, newctx
 (* | _ -> nonimplement ~moreinfo:__LOC__ () *)
 end
 
@@ -4287,7 +4342,7 @@ let rec inh_extend_inputtype ?(postpone_recursor = false) (newfamname : fam_name
     let result = 
       let ((basename, _), (_, _)), ctx = fst i in  
       ref (empty_inh basename newfamname ctx) in 
-    List.iter (
+    output_names |> List.iter (
       fun each_outputname ->
         let _ = 
           let open Pp in 
@@ -4375,18 +4430,21 @@ let rec inh_extend_inputtype ?(postpone_recursor = false) (newfamname : fam_name
               | _ -> cerror ~einfo:("It should be a Family!"^__LOC__) ())
             | CInhFThm {kind = `Extend; motive = motive_in_coqtm; compiled_handlers =  handlers_in_mod; rec_cstr = rec_constr; all_handlers} , _ ->
               (match inpty with 
-                | FTheoremTy {motive; indref; postfix; recty; all_handlers = all_handlers_earlier}, _ -> 
+                | FTheoremTy {fnames; motive; indrefs; postfix; recty; all_handlers = all_handlers_earlier}, _ ->
                 (* let motive = wkinh_coq_type motive current_ctx in  *)
-                let indref = wkinh_path indref current_ctx in 
-                let recty  = wkinh_coq_type recty current_ctx in  
-                let motive_in_coqtm = wkinh_coq_term motive_in_coqtm current_ctx in 
-                let handlers_in_mod = wkinh_coq_term handlers_in_mod current_ctx in 
-                let complete_all_handlers = 
-                  let earlier_handlers_set = Set_Name.add_seq (List.to_seq all_handlers_earlier) Set_Name.empty in 
-                  let added_handlers = List.filter (fun x -> not (Set_Name.mem x earlier_handlers_set)) all_handlers in 
-                  all_handlers_earlier @ added_handlers
-                in 
-                inhnew_or_extend_fthm !result each_outputname (Some inpty) rec_constr handlers_in_mod motive indref recty complete_all_handlers motive_in_coqtm
+                let indrefs = List.map (fun indref -> wkinh_path (indref, (snd indrefs)) current_ctx) (fst indrefs) in
+                let indrefs = List.map fst indrefs, snd (List.hd indrefs) in
+                let recty = wkinh_coq_type recty current_ctx in  
+                let motive_in_coqtm = wkinh_coq_term motive_in_coqtm current_ctx in
+                let handlers_in_mod = wkinh_coq_term handlers_in_mod current_ctx in
+                let complete_all_handlers =
+                  (List.combine all_handlers_earlier all_handlers) |> List.map (
+                    fun (handlers_earlier, handlers) -> 
+                      let earlier_handlers_set = Set_Name.add_seq (List.to_seq handlers_earlier) Set_Name.empty in
+                      let added_handlers = List.filter (fun x -> not (Set_Name.mem x earlier_handlers_set)) handlers in
+                      handlers_earlier @ added_handlers)
+                in
+                inhnew_or_extend_fthm !result fnames (Some inpty) rec_constr handlers_in_mod motive indrefs recty complete_all_handlers motive_in_coqtm
                 | _, _ -> cerror ~einfo:"__LOC__" ()
               ) 
             | _ -> 
@@ -4403,7 +4461,7 @@ let rec inh_extend_inputtype ?(postpone_recursor = false) (newfamname : fam_name
             inhnew !result each_outputname ~newinhop ~newoupty)
         in 
         result := newinh
-    ) output_names; 
+    ); 
     !result
   in
   let _ = 
@@ -4451,7 +4509,7 @@ let rec inh_direct_compose (newfamname : fam_name) (fsti : inh) (nexti : inh) : 
       let ctx = snd @@ fst nexti in  
       ref (empty_inh basename newfamname ctx) 
     in  
-    List.iter (
+    output_field_names |> List.iter (
       fun (each_outputfield, oupty) -> 
         let current_ctx = 
           let current_inh = fst !result in 
@@ -4546,7 +4604,7 @@ let rec inh_direct_compose (newfamname : fam_name) (fsti : inh) (nexti : inh) : 
           | _, _ -> nonimplement ~moreinfo:"Unsupported Inheritance composition!" ()
           ) in 
           result := newinh
-    ) output_field_names;
+    );
     (* now we attach input-ty into result *)
     let newinh = 
       let incorrect_inp = !result in 
@@ -4727,6 +4785,3 @@ let inh_mixin_pre (a : inh) (b : inh) : pre_inh =
   ) newoupfields in 
   (* Now for each field,  we collect the pieces *)
   (!result_dict, newoupfields)  *)
-
-
-
